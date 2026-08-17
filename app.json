@@ -1,0 +1,43 @@
+{
+  "expo": {
+    "name": "Amaze Escape",
+    "slug": "amaze-escape",
+    "scheme": "amazeescape",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "light",
+    "newArchEnabled": true,
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.amazeescape.app"
+    },
+    "android": {
+      "package": "com.amazeescape.app",
+      "adaptiveIcon": {
+        "backgroundColor": "#D6F0F7",
+        "foregroundImage": "./assets/android-icon-foreground.png",
+        "backgroundImage": "./assets/android-icon-background.png",
+        "monochromeImage": "./assets/android-icon-monochrome.png"
+      },
+      "predictiveBackGestureEnabled": false
+    },
+    "web": {
+      "favicon": "./assets/favicon.png"
+    },
+    "plugins": [
+      "expo-router",
+      "expo-sqlite"
+    ],
+    "experiments": {
+      "typedRoutes": true
+    },
+    "extra": {
+      "router": {},
+      "eas": {
+        "projectId": "c9fbc851-f5aa-429d-8de9-f522033c2485"
+      }
+    },
+    "owner": "jika0584"
+  }
+}
