@@ -9,7 +9,7 @@ export function hasWon(state: BoardState): boolean {
 }
 
 export function hasLost(state: BoardState): boolean {
-  return state.lives <= 0;
+  return state.status === 'lost';
 }
 
 /** Ids of arrows that can escape right now — powers the hint button. */

@@ -1,128 +1,147 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
-import { ActivityIndicator, LayoutChangeEvent, StyleSheet, Text, View } from 'react-native';
-import { SafeAreaView } from 'react-native-safe-area-context';
-import { Level } from '../src/levels/types';
-import { LevelRepository } from '../src/sync/LevelRepository';
+import React, { useCallback, useEffect, useState } from 'react';
+import { ActivityIndicator, Pressable, StyleSheet, Text, View } from 'react-native';
+import { useFocusEffect, useRouter } from 'expo-router';
+import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
+import { MenuButton } from '../src/components/MenuButton';
+import { SettingsMenu } from '../src/components/SettingsMenu';
+import { SHOW_DEV_TOOLS } from '../src/dev/flags';
 import { useProgressStore } from '../src/store/progressStore';
-import { useBoard } from '../src/game/hooks/useBoard';
-import { fitBoardToViewport } from '../src/game/rendering/Camera';
-import { GameCanvas } from '../src/components/GameCanvas';
-import { Hud } from '../src/components/Hud';
-import { LevelOverlay } from '../src/components/LevelOverlay';
-import { colors, spacing, typography } from '../src/theme/theme';
+import { formatCatalogDate, useCatalogStamp } from '../src/store/catalogStamp';
+import { isResumable, loadRunCache, RunCache } from '../src/store/runCache';
+import { LevelRepository } from '../src/sync/LevelRepository';
+import { DEMO_ENDING_LEVEL } from '../src/levels/demoEnding';
+import { MIN_TOUCH_TARGET, spacing, typography, useColors } from '../src/theme/theme';
 
-export default function GameScreen() {
-  const {
-    hydrated,
-    hydrate,
-    currentCuratedLevel,
-    currentSLevelIndex,
-    completeLevel,
-    exhaustCuratedLevels,
-  } = useProgressStore();
-
-  const [level, setLevel] = useState<Level | null>(null);
-  const [viewport, setViewport] = useState({ width: 0, height: 0 });
+export default function MainMenuScreen() {
+  const router = useRouter();
+  const colors = useColors();
+  const { hydrated, hydrate, currentCuratedLevel, currentSLevelIndex, catchUpCampaignIfNeeded } =
+    useProgressStore();
+  const catalogUpdatedAt = useCatalogStamp((state) => state.updatedAt);
+  const highestCampaign = useCatalogStamp((state) => state.highestCampaign);
+  const insets = useSafeAreaInsets();
+  const [runCache, setRunCache] = useState<RunCache | null | undefined>(undefined);
+  const [checking, setChecking] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
 
   useEffect(() => {
     void hydrate();
   }, [hydrate]);
 
-  const loadLevel = useCallback(async () => {
-    const resolved = await LevelRepository.getNextLevel({
-      curatedLevel: currentCuratedLevel,
-      sLevelIndex: currentSLevelIndex,
-    });
-
-    if (resolved.usedFallback && currentCuratedLevel !== null) {
-      await exhaustCuratedLevels();
-    }
-    setLevel(resolved.level);
-  }, [currentCuratedLevel, currentSLevelIndex, exhaustCuratedLevels]);
-
   useEffect(() => {
-    if (!hydrated) return;
-    void loadLevel();
-  }, [hydrated, loadLevel]);
+    void loadRunCache().then(setRunCache);
+  }, []);
 
-  if (!level || !hydrated) {
-    return (
-      <SafeAreaView style={styles.loading}>
-        <ActivityIndicator size="large" color={colors.arrow} />
-        <Text style={styles.loadingLabel}>Preparing your maze…</Text>
-      </SafeAreaView>
-    );
-  }
+  useFocusEffect(
+    useCallback(() => {
+      if (runCache === undefined) return;
+      const unfinishedEndlessRun = isResumable(runCache) && runCache.levelId.startsWith('S');
+      void catchUpCampaignIfNeeded({ unfinishedEndlessRun });
+    }, [catchUpCampaignIfNeeded, runCache, highestCampaign]),
+  );
+
+  const checkForUpdates = useCallback(async () => {
+    if (checking) return;
+    setChecking(true);
+    try {
+      await LevelRepository.syncNow(currentCuratedLevel);
+    } finally {
+      setChecking(false);
+    }
+  }, [checking, currentCuratedLevel]);
+
+  const resumeLabel = !hydrated
+    ? undefined
+    : currentCuratedLevel !== null
+      ? `Level ${currentCuratedLevel}`
+      : `Endless ${currentSLevelIndex}`;
+
+  const expectedId =
+    currentCuratedLevel !== null ? String(currentCuratedLevel) : `S${currentSLevelIndex}`;
+  const caption =
+    resumeLabel && isResumable(runCache) && runCache.levelId === expectedId
+      ? `Resume ${resumeLabel}`
+      : resumeLabel;
 
   return (
-    <Board
-      level={level}
-      viewport={viewport}
-      onViewportChange={setViewport}
-      onAdvance={async () => {
-        await completeLevel(level.id);
-        void LevelRepository.onLevelCompleted(level.id);
-        setLevel(null);
-      }}
-    />
-  );
-}
+    <SafeAreaView style={[styles.screen, { backgroundColor: colors.background }]} edges={['top']}>
+      <View style={styles.header}>
+        <Text style={[styles.title, { color: colors.textPrimary }]} accessibilityRole="header">
+          AMAZE
+        </Text>
+        <Text style={[styles.subtitle, { color: colors.textSecondary }]}>ESCAPE</Text>
+        <View style={styles.headerActions}>
+          {SHOW_DEV_TOOLS ? (
+            <Pressable
+              onPress={() => void checkForUpdates()}
+              disabled={checking}
+              accessibilityRole="button"
+              accessibilityLabel="Check for new puzzles"
+              hitSlop={12}
+              style={({ pressed }) => [
+                styles.iconButton,
+                { backgroundColor: colors.surface },
+                pressed && styles.iconPressed,
+              ]}
+            >
+              {checking ? (
+                <ActivityIndicator size="small" color={colors.arrow} />
+              ) : (
+                <Text style={[styles.iconGlyph, { color: colors.textPrimary }]}>↻</Text>
+              )}
+            </Pressable>
+          ) : null}
+          <Pressable
+            onPress={() => setSettingsOpen(true)}
+            accessibilityRole="button"
+            accessibilityLabel="Settings"
+            hitSlop={12}
+            style={({ pressed }) => [
+              styles.iconButton,
+              { backgroundColor: colors.surface },
+              pressed && styles.iconPressed,
+            ]}
+          >
+            <Text style={[styles.iconGlyph, { color: colors.textPrimary }]}>⚙</Text>
+          </Pressable>
+        </View>
+      </View>
 
-interface BoardProps {
-  level: Level;
-  viewport: { width: number; height: number };
-  onViewportChange: (size: { width: number; height: number }) => void;
-  onAdvance: () => void;
-}
-
-function Board({ level, viewport, onViewportChange, onAdvance }: BoardProps) {
-  const { state, animations, tapArrow, onArrowAnimationEnd, restart } = useBoard(level);
-
-  const layout = useMemo(
-    () =>
-      viewport.width > 0 && viewport.height > 0
-        ? fitBoardToViewport(level.grid, viewport)
-        : null,
-    [level.grid, viewport],
-  );
-
-  const handleLayout = useCallback(
-    (event: LayoutChangeEvent) => {
-      const { width, height } = event.nativeEvent.layout;
-      onViewportChange({ width, height });
-    },
-    [onViewportChange],
-  );
-
-  const levelLabel = level.id.startsWith('S')
-    ? `Endless ${level.id.slice(1)}`
-    : `Level ${level.id}`;
-
-  return (
-    <SafeAreaView style={styles.screen} edges={['top', 'bottom']}>
-      <Hud levelLabel={levelLabel} lives={state.lives} onRestart={restart} />
-
-      <View style={styles.canvasArea} onLayout={handleLayout}>
-        {layout && (
-          <GameCanvas
-            grid={level.grid}
-            arrows={state.arrows}
-            layout={layout}
-            width={viewport.width}
-            height={viewport.height}
-            animations={animations}
-            onArrowTap={tapArrow}
-            onArrowAnimationEnd={onArrowAnimationEnd}
-          />
+      <View style={[styles.actions, { paddingBottom: Math.max(insets.bottom, spacing.xl) }]}>
+        <MenuButton
+          label="Start"
+          caption={caption}
+          variant="primary"
+          onPress={() => router.push('/game')}
+        />
+        {SHOW_DEV_TOOLS ? (
+          <View style={styles.row}>
+            <MenuButton compact label="Choose level" onPress={() => router.push('/stages')} />
+            <MenuButton
+              compact
+              label="Test ending"
+              caption={`${DEMO_ENDING_LEVEL.arrows.length} arrows`}
+              onPress={() => router.push('/game?sandbox=ending')}
+            />
+          </View>
+        ) : (
+          <MenuButton label="Choose level" onPress={() => router.push('/stages')} />
+        )}
+        {catalogUpdatedAt != null && (
+          <Text style={[styles.stamp, { color: colors.textSecondary }]} accessibilityRole="text">
+            Updated {formatCatalogDate(catalogUpdatedAt)}
+          </Text>
         )}
       </View>
 
-      <Text style={styles.hint} accessibilityRole="text">
-        Tap an arrow head to send it out. Pinch or drag with two fingers to zoom.
-      </Text>
-
-      {state.status === 'won' && <LevelOverlay kind="won" onPrimary={onAdvance} />}
-      {state.status === 'lost' && <LevelOverlay kind="lost" onPrimary={restart} />}
+      <SettingsMenu
+        visible={settingsOpen}
+        onClose={() => setSettingsOpen(false)}
+        onChangeLevel={() => {
+          setSettingsOpen(false);
+          router.push('/stages');
+        }}
+      />
     </SafeAreaView>
   );
 }
@@ -130,28 +149,60 @@ function Board({ level, viewport, onViewportChange, onAdvance }: BoardProps) {
 const styles = StyleSheet.create({
   screen: {
     flex: 1,
-    backgroundColor: colors.background,
-  },
-  canvasArea: {
-    flex: 1,
-    marginHorizontal: spacing.sm,
-  },
-  hint: {
-    ...typography.body,
-    color: colors.textSecondary,
-    textAlign: 'center',
-    paddingHorizontal: spacing.md,
+    justifyContent: 'space-between',
+    paddingHorizontal: spacing.lg,
+    paddingTop: spacing.xl,
     paddingBottom: spacing.md,
   },
-  loading: {
-    flex: 1,
+  headerActions: {
+    position: 'absolute',
+    right: 0,
+    top: '50%',
+    marginTop: -MIN_TOUCH_TARGET / 2,
+    zIndex: 2,
+    flexDirection: 'row',
+    gap: spacing.sm,
+  },
+  iconButton: {
+    width: MIN_TOUCH_TARGET,
+    height: MIN_TOUCH_TARGET,
+    borderRadius: MIN_TOUCH_TARGET / 2,
     alignItems: 'center',
     justifyContent: 'center',
-    gap: spacing.md,
-    backgroundColor: colors.background,
   },
-  loadingLabel: {
-    ...typography.body,
-    color: colors.textSecondary,
+  iconPressed: {
+    opacity: 0.6,
+  },
+  iconGlyph: {
+    fontSize: 24,
+  },
+  header: {
+    flex: 1,
+    justifyContent: 'center',
+    position: 'relative',
+  },
+  title: {
+    fontSize: 64,
+    fontWeight: '800',
+    letterSpacing: 6,
+    textAlign: 'center',
+  },
+  subtitle: {
+    ...typography.title,
+    letterSpacing: 14,
+    textAlign: 'center',
+  },
+  actions: {
+    gap: spacing.md,
+  },
+  row: {
+    flexDirection: 'row',
+    gap: spacing.md,
+  },
+  stamp: {
+    ...typography.label,
+    textAlign: 'center',
+    marginTop: spacing.sm,
+    opacity: 0.8,
   },
 });

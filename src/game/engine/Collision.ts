@@ -12,10 +12,13 @@ export type SlideOutcome = 'escaped' | 'blocked';
 export interface SlideResult {
   outcome: SlideOutcome;
   /**
-   * Cells travelled before leaving the board (escape) or before recoiling
-   * (blocked). Drives the animation distance.
+   * How far the arrow advances along its travel path, measured in cells.
+   * On escape this covers the whole body leaving the board; on a block it is
+   * the free run before the recoil.
    */
   distance: number;
+  /** Steps the head itself can advance before something stops it. */
+  headSteps: number;
   /** Arrow id that stopped the slide, when blocked by another arrow. */
   blockedBy?: string;
   /** Cell that caused the block — used to aim the recoil bump. */
@@ -25,11 +28,14 @@ export interface SlideResult {
 /**
  * Resolves a tap on an arrow head.
  *
- * The arrow advances one cell at a time along its escape vector. Every cell of
- * the body must be able to advance, so the ray is cast against the *live*
- * occupancy of all other arrows plus any static blockers. Cells marked as
- * outside the board silhouette are pass-through: they shape the board without
- * walling arrows in.
+ * Arrows move like a snake: the head advances along its escape vector and every
+ * other segment follows the path the segment ahead of it just left. Because the
+ * body only ever moves into cells the arrow already occupies, it can never
+ * collide with anything — so the entire outcome is decided by casting a single
+ * ray from the head against the live occupancy of the other arrows.
+ *
+ * Cells outside the board silhouette are pass-through; they shape the board
+ * without walling arrows in.
  */
 export function resolveSlide(
   arrow: ArrowDefinition,
@@ -37,46 +43,56 @@ export function resolveSlide(
   occupancy: OccupancyIndex,
 ): SlideResult {
   const delta = DIRECTION_DELTA[arrow.direction];
+  const head = arrowHead(arrow);
+  const bodyCells = arrow.cells.length;
 
-  // Enough travel to clear the board from any starting position.
-  const maxSteps = grid.rows + grid.cols + arrow.cells.length;
+  // Bounded by the board diagonal; the head must leave within this many steps.
+  const maxSteps = grid.rows + grid.cols + 2;
 
   for (let step = 1; step <= maxSteps; step++) {
-    let allOutside = true;
+    const next: GridCell = {
+      row: head.row + delta.row * step,
+      col: head.col + delta.col * step,
+    };
 
-    for (const cell of arrow.cells) {
-      const next: GridCell = {
-        row: cell.row + delta.row * step,
-        col: cell.col + delta.col * step,
+    if (!isInsideGrid(grid, next)) {
+      // Head is clear of the board; the tail needs the body length to follow.
+      return {
+        outcome: 'escaped',
+        distance: step + bodyCells - 1,
+        headSteps: step,
       };
-
-      if (!isInsideGrid(grid, next)) continue; // this part has left the board
-      allOutside = false;
-
-      if (isBlocker(grid, next)) {
-        return { outcome: 'blocked', distance: step - 1, blockedAt: next };
-      }
-
-      const occupant = occupancy.occupantAt(next);
-      if (occupant && occupant !== arrow.id) {
-        return {
-          outcome: 'blocked',
-          distance: step - 1,
-          blockedBy: occupant,
-          blockedAt: next,
-        };
-      }
     }
 
-    if (allOutside) {
-      return { outcome: 'escaped', distance: step };
+    if (isBlocker(grid, next)) {
+      return {
+        outcome: 'blocked',
+        distance: step - 1,
+        headSteps: step - 1,
+        blockedAt: next,
+      };
+    }
+
+    const occupant = occupancy.occupantAt(next);
+    if (occupant && occupant !== arrow.id) {
+      return {
+        outcome: 'blocked',
+        distance: step - 1,
+        headSteps: step - 1,
+        blockedBy: occupant,
+        blockedAt: next,
+      };
     }
   }
 
-  return { outcome: 'escaped', distance: maxSteps };
+  return {
+    outcome: 'escaped',
+    distance: maxSteps + bodyCells - 1,
+    headSteps: maxSteps,
+  };
 }
 
-/** Non-mutating check used by hint and preview logic. */
+/** Non-mutating check used by hint, generator and solvability logic. */
 export function canEscape(
   arrow: ArrowDefinition,
   grid: LevelGrid,

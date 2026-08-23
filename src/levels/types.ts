@@ -39,12 +39,20 @@ export interface ArrowDefinition {
   /** Ordered path; final element is the tappable head. */
   cells: GridCell[];
   direction: Direction;
+  /**
+   * How the generator placed this piece. Omitted on the reverse-built core.
+   * `filler` — pocket / hole packing that still follows solve-order rules.
+   * `crumb` — last leftover plugs (2–4 cells).
+   */
+  role?: 'filler' | 'crumb';
 }
 
 export type Difficulty = 'easy' | 'medium' | 'hard';
 
 export interface LevelMetadata {
   arrowCount: number;
+  /** Human-readable name for a curated board, e.g. its silhouette. */
+  name?: string;
   /** Present on S-levels for reproducibility. */
   seed?: number;
   difficulty?: Difficulty;
@@ -55,6 +63,8 @@ export interface LevelMetadata {
    * Emitted by the procedural generator; optional for curated levels.
    */
   solutionOrder?: string[];
+  /** Image file used as the board silhouette, if any. */
+  shapeSource?: string;
 }
 
 export interface LevelGrid {

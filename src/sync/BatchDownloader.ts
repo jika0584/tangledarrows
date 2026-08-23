@@ -1,5 +1,6 @@
 import { Level, LevelBatchManifest } from '../levels/types';
 import { parseLevel } from '../levels/parser';
+import { useCatalogStamp } from '../store/catalogStamp';
 import { getSupabase } from './supabaseClient';
 import { LocalCache } from './LocalCache';
 
@@ -43,14 +44,24 @@ export const BatchDownloader = {
     }
 
     const startLevel = Math.max(fromLevel, (highestCached ?? fromLevel - 1) + 1);
-    const endLevel = startLevel + BATCH_SIZE - 1;
+    return this.fetchBatchStartingAt(startLevel);
+  },
+
+  /**
+   * Pulls one batch starting at `startLevel`, even if the local cache already
+   * looks full. Used on launch so newly uploaded rows arrive without waiting
+   * for the player to reach the end of the previous batch.
+   */
+  async fetchBatchStartingAt(startLevel: number): Promise<BatchDownloadResult> {
+    const supabase = getSupabase();
+    if (!supabase) return { status: 'offline', levelsAdded: 0 };
 
     const { data, error } = await supabase
       .from('levels')
       .select('level_number, payload')
       .gte('level_number', startLevel)
-      .lte('level_number', endLevel)
-      .order('level_number', { ascending: true });
+      .order('level_number', { ascending: true })
+      .limit(BATCH_SIZE);
 
     if (error) return { status: 'offline', levelsAdded: 0 };
     if (!data || data.length === 0) return { status: 'exhausted', levelsAdded: 0 };
@@ -58,12 +69,17 @@ export const BatchDownloader = {
     const levels = parseRows(data as LevelRow[]);
     if (levels.length === 0) return { status: 'exhausted', levelsAdded: 0 };
 
+    const numbers = (data as LevelRow[]).map((row) => row.level_number);
+    const endLevel = numbers[numbers.length - 1] ?? startLevel + BATCH_SIZE - 1;
     const batchId = `batch-${startLevel}-${endLevel}`;
-    await LocalCache.saveBatch(batchId, levels);
+    const changed = await LocalCache.saveBatch(batchId, levels);
+    if (changed > 0) {
+      await useCatalogStamp.getState().recordUpdate();
+    }
 
     return {
       status: 'downloaded',
-      levelsAdded: levels.length,
+      levelsAdded: changed,
       manifest: {
         batchId,
         startLevel,
@@ -71,6 +87,27 @@ export const BatchDownloader = {
         levelCount: levels.length,
       },
     };
+  },
+
+  /** Highest numbered campaign row in the cloud table, if any. */
+  async highestRemoteLevel(): Promise<{ highest: number | null; error?: string }> {
+    const supabase = getSupabase();
+    if (!supabase) {
+      return { highest: null, error: 'Cloud catalog is not configured on this build.' };
+    }
+
+    const { data, error } = await supabase
+      .from('levels')
+      .select('level_number')
+      .order('level_number', { ascending: false })
+      .limit(1);
+
+    if (error) return { highest: null, error: error.message };
+    if (data?.[0]?.level_number != null) {
+      return { highest: data[0].level_number };
+    }
+
+    return { highest: null };
   },
 
   /**
@@ -89,7 +126,11 @@ function parseRows(rows: LevelRow[]): Level[] {
     try {
       const raw =
         typeof row.payload === 'string' ? JSON.parse(row.payload) : row.payload;
-      levels.push(parseLevel(raw));
+      const patched =
+        raw && typeof raw === 'object'
+          ? { ...(raw as object), id: String(row.level_number), source: 'curated' }
+          : raw;
+      levels.push(parseLevel(patched));
     } catch {
       continue;
     }

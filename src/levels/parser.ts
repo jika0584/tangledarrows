@@ -3,6 +3,7 @@ import {
   ArrowDefinition,
   CELL_FLOOR,
   CellValue,
+  DIRECTION_DELTA,
   Direction,
   Level,
   LevelGrid,
@@ -107,7 +108,23 @@ function parseArrows(raw: unknown, grid: LevelGrid): ArrowDefinition[] {
       return { row, col };
     });
 
-    return { id, cells, direction };
+    // The arrowhead is drawn along the segment feeding into it, so that segment
+    // has to run in the escape direction or the head would point off-axis.
+    const neck = cells[cells.length - 2];
+    const tip = cells[cells.length - 1];
+    const delta = DIRECTION_DELTA[direction];
+    if (tip.row - neck.row !== delta.row || tip.col - neck.col !== delta.col) {
+      throw new LevelParseError(
+        `Arrow ${id} head does not sit on a neck pointing ${direction}`,
+      );
+    }
+
+    return {
+      id,
+      cells,
+      direction,
+      role: a.role === 'crumb' ? 'crumb' : a.role === 'filler' ? 'filler' : undefined,
+    };
   });
 }
 
@@ -117,6 +134,7 @@ function parseMetadata(raw: unknown, arrowCount: number): LevelMetadata {
   const m = raw as Record<string, unknown>;
   return {
     ...base,
+    name: typeof m.name === 'string' ? m.name : undefined,
     seed: typeof m.seed === 'number' ? m.seed : undefined,
     difficulty:
       m.difficulty === 'easy' || m.difficulty === 'medium' || m.difficulty === 'hard'
@@ -126,6 +144,7 @@ function parseMetadata(raw: unknown, arrowCount: number): LevelMetadata {
     solutionOrder: Array.isArray(m.solutionOrder)
       ? m.solutionOrder.filter((id): id is string => typeof id === 'string')
       : undefined,
+    shapeSource: typeof m.shapeSource === 'string' && m.shapeSource.length > 0 ? m.shapeSource : undefined,
   };
 }
 

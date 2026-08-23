@@ -4,9 +4,17 @@
     "slug": "amaze-escape",
     "scheme": "amazeescape",
     "version": "1.0.0",
+    "runtimeVersion": {
+      "policy": "appVersion"
+    },
+    "updates": {
+      "url": "https://u.expo.dev/c9fbc851-f5aa-429d-8de9-f522033c2485",
+      "checkAutomatically": "NEVER",
+      "fallbackToCacheTimeout": 0
+    },
     "orientation": "portrait",
     "icon": "./assets/icon.png",
-    "userInterfaceStyle": "light",
+    "userInterfaceStyle": "automatic",
     "newArchEnabled": true,
     "ios": {
       "supportsTablet": true,
@@ -27,7 +35,23 @@
     },
     "plugins": [
       "expo-router",
-      "expo-sqlite"
+      "expo-sqlite",
+      "expo-updates",
+      [
+        "expo-navigation-bar",
+        {
+          "hidden": true,
+          "enforceContrast": false
+        }
+      ],
+      [
+        "expo-splash-screen",
+        {
+          "backgroundColor": "#D6F0F7",
+          "image": "./assets/splash-icon.png",
+          "imageWidth": 200
+        }
+      ]
     ],
     "experiments": {
       "typedRoutes": true
@@ -36,7 +60,9 @@
       "router": {},
       "eas": {
         "projectId": "c9fbc851-f5aa-429d-8de9-f522033c2485"
-      }
+      },
+      "supabaseUrl": "https://nqcnmhgxcfctsbaeejzl.supabase.co",
+      "supabaseAnonKey": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im5xY25taGd4Y2ZjdHNiYWVlanpsIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODcwNTIxMjgsImV4cCI6MjEwMjYyODEyOH0.2hk8xxw7re3Nn4fXDVbCv_ZAr6KKGmYy0Z1eOduOsf0"
     },
     "owner": "jika0584"
   }

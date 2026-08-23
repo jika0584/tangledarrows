@@ -32,19 +32,32 @@ async function getDb(): Promise<SQLite.SQLiteDatabase> {
  * footprint stays small no matter how far the player progresses.
  */
 export const LocalCache = {
-  async saveBatch(batchId: string, levels: Level[]): Promise<void> {
+  /**
+   * Writes a batch. Returns how many rows were new or actually different so
+   * callers can stamp an update date only when content changed.
+   */
+  async saveBatch(batchId: string, levels: Level[]): Promise<number> {
     const db = await getDb();
+    let changed = 0;
     await db.withTransactionAsync(async () => {
       for (const level of levels) {
+        const payload = JSON.stringify(level);
+        const existing = await db.getFirstAsync<{ payload: string }>(
+          'SELECT payload FROM levels WHERE id = ? LIMIT 1',
+          level.id,
+        );
+        if (existing?.payload === payload) continue;
         await db.runAsync(
           'INSERT OR REPLACE INTO levels (id, level_number, batch_id, payload) VALUES (?, ?, ?, ?)',
           level.id,
           parseInt(level.id, 10),
           batchId,
-          JSON.stringify(level),
+          payload,
         );
+        changed++;
       }
     });
+    return changed;
   },
 
   async getLevel(levelNumber: number): Promise<Level | null> {

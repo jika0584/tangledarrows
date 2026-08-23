@@ -43,3 +43,9 @@ yarn-error.*
 # generated native folders
 /ios
 /android
+
+# PX campaign catalog (generated locally, uploaded to Supabase)
+tools/px/data/
+px.exe
+tools/px-ui/dist/
+tools/px-ui/dist-electron/

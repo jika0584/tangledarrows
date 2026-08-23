@@ -2,13 +2,14 @@
  * Sanity checks for level generation and collision.
  * Run with: npm run test:levels
  */
-import sampleCuratedLevel from '../../levels/samples/level-001.json';
-import { generateSLevel, SLevelGenerator } from '../SLevelGenerator';
+import { generateSLevel, fillLevelVacancies, SLevelGenerator } from '../SLevelGenerator';
 import { parseLevel } from '../../levels/parser';
-import { isSolvable } from '../../game/engine/WinCondition';
+import { escapableArrowIds, isSolvable } from '../../game/engine/WinCondition';
 import { OccupancyIndex } from '../../game/engine/Grid';
 import { resolveSlide } from '../../game/engine/Collision';
-import { CELL_FLOOR, CELL_OUTSIDE, CellValue } from '../../levels/types';
+import { applyTap, createBoardState } from '../../game/engine/Movement';
+import { CELL_FLOOR, CELL_OUTSIDE, CellValue, DIRECTION_DELTA, MAX_LIVES } from '../../levels/types';
+import { DEMO_ENDING_LEVEL } from '../../levels/demoEnding';
 
 let failures = 0;
 
@@ -32,6 +33,117 @@ check('same seed produces identical levels', () => {
   assert(JSON.stringify(a) === JSON.stringify(b), 'levels differ for identical seed');
 });
 
+check('a random salt produces a different layout for the same S-number', () => {
+  const a = generateSLevel(5, undefined, { randomSalt: 1 });
+  const b = generateSLevel(5, undefined, { randomSalt: 2 });
+  const again = generateSLevel(5, undefined, { randomSalt: 1 });
+  assert(JSON.stringify(a) !== JSON.stringify(b), 'random salts produced the same maze');
+  assert(JSON.stringify(a) === JSON.stringify(again), 'same salt did not replay');
+  assert(a.metadata.seed !== b.metadata.seed, 'salted seeds were not mixed');
+});
+
+check('core heads jump zones instead of clustering in one quadrant', () => {
+  const level = generateSLevel(8);
+  const core = level.arrows.filter((arrow) => !arrow.role);
+  const rows = level.grid.rows;
+  const cols = level.grid.cols;
+  const zoneOf = (arrow: (typeof core)[number]): number => {
+    const head = arrow.cells[arrow.cells.length - 1];
+    const rowBand = Math.min(1, Math.floor((head.row * 2) / rows));
+    const colBand = Math.min(1, Math.floor((head.col * 2) / cols));
+    return rowBand * 2 + colBand;
+  };
+  const zones = core.slice(0, Math.min(20, core.length)).map(zoneOf);
+  let run = 1;
+  let maxRun = 1;
+  for (let i = 1; i < zones.length; i++) {
+    if (zones[i] === zones[i - 1]) {
+      run += 1;
+      if (run > maxRun) maxRun = run;
+    } else {
+      run = 1;
+    }
+  }
+  assert(
+    maxRun <= 3,
+    `S8 placed ${maxRun} heads in a row in the same quadrant`,
+  );
+  const unique = new Set(zones);
+  assert(unique.size >= 3, `S8 only used ${unique.size} of 4 quadrants for the first heads`);
+});
+
+check('adjacent arrows do not unzip in the same escape direction', () => {
+  const axisOf = (direction: string): 'h' | 'v' =>
+    direction === 'left' || direction === 'right' ? 'h' : 'v';
+  for (const index of [8, 40]) {
+    const level = generateSLevel(index);
+    const owner = new Map<string, (typeof level.arrows)[number]>();
+    for (const arrow of level.arrows) {
+      if (arrow.role) continue;
+      for (const cell of arrow.cells) owner.set(`${cell.row},${cell.col}`, arrow);
+    }
+    let adjacent = 0;
+    let spoons = 0;
+    const seen = new Set<string>();
+    for (const arrow of level.arrows) {
+      if (arrow.role) continue;
+      for (const cell of arrow.cells) {
+        const sides =
+          axisOf(arrow.direction) === 'h'
+            ? [
+                [1, 0],
+                [-1, 0],
+              ]
+            : [
+                [0, 1],
+                [0, -1],
+              ];
+        for (const [dr, dc] of sides) {
+          const other = owner.get(`${cell.row + dr},${cell.col + dc}`);
+          if (!other || other.id === arrow.id) continue;
+          const pair = [arrow.id, other.id].sort().join('|');
+          const edge = `${pair}@${Math.min(cell.row, cell.row + dr)},${Math.min(cell.col, cell.col + dc)}`;
+          if (seen.has(edge)) continue;
+          seen.add(edge);
+          adjacent += 1;
+          if (other.direction === arrow.direction) spoons += 1;
+        }
+      }
+    }
+    assert(
+      adjacent === 0 || spoons / adjacent <= 0.2,
+      `S${index} had ${spoons} same-direction parallel stacks out of ${adjacent} side-by-side contacts`,
+    );
+  }
+});
+
+check('quadrants mix escape directions instead of lazy border exits', () => {
+  const level = generateSLevel(12);
+  const rows = level.grid.rows;
+  const cols = level.grid.cols;
+  const buckets: Record<string, number>[] = [{}, {}, {}, {}];
+  const totals = [0, 0, 0, 0];
+  for (const arrow of level.arrows) {
+    if (arrow.role === 'crumb') continue;
+    const head = arrow.cells[arrow.cells.length - 1];
+    const zone =
+      Math.min(1, Math.floor((head.row * 2) / rows)) * 2 +
+      Math.min(1, Math.floor((head.col * 2) / cols));
+    buckets[zone][arrow.direction] = (buckets[zone][arrow.direction] ?? 0) + 1;
+    totals[zone] += 1;
+  }
+  for (let zone = 0; zone < 4; zone++) {
+    if (totals[zone] < 6) continue;
+    for (const [direction, count] of Object.entries(buckets[zone])) {
+      const share = count / totals[zone];
+      assert(
+        share <= 0.5,
+        `S12 quadrant ${zone} put ${(share * 100).toFixed(0)}% of heads on ${direction}`,
+      );
+    }
+  }
+});
+
 check('generated levels pass schema validation', () => {
   for (const index of [1, 5, 40, 120, 400]) {
     const level = generateSLevel(index);
@@ -42,6 +154,20 @@ check('generated levels pass schema validation', () => {
       'arrowCount does not match arrows array',
     );
   }
+});
+
+check('fillVacancies packs leftover floor without breaking the schema', () => {
+  const level = generateSLevel(11, 8);
+  const kept = level.arrows.slice(0, Math.max(6, Math.floor(level.arrows.length * 0.6)));
+  const trimmed = {
+    ...level,
+    arrows: kept,
+    metadata: { ...level.metadata, arrowCount: kept.length, solutionOrder: undefined },
+  };
+  const filled = fillLevelVacancies(trimmed, 21);
+  assert(filled.arrows.length > trimmed.arrows.length, 'generate fill added no arrows');
+  const parsed = parseLevel(filled);
+  assert(parsed.arrows.length === filled.arrows.length, 'filled level failed to round-trip');
 });
 
 check('every generated level is fully solvable', () => {
@@ -68,14 +194,182 @@ check('recorded solutionOrder actually clears the board', () => {
   assert(remaining.length === 0, 'board not cleared by solutionOrder');
 });
 
-check('grid sizes stay within the 10x10 to 30x30 range', () => {
+check('grid sizes stay within the 36x36 to 60x60 range', () => {
   for (const index of [1, 200, 900, 5000]) {
     const level = generateSLevel(index);
     const interior = level.grid.rows - 2;
-    assert(interior >= 10 && interior <= 30, `interior ${interior} out of range at S${index}`);
+    assert(interior >= 36 && interior <= 60, `interior ${interior} out of range at S${index}`);
     assert(level.grid.rows === level.grid.matrix.length, 'row count mismatch');
     assert(level.grid.cols === level.grid.matrix[0].length, 'col count mismatch');
   }
+});
+
+check('every S-level carries at least 25 arrows', () => {
+  for (const index of [1, 2, 3, 17, 200, 5000]) {
+    const level = generateSLevel(index);
+    assert(
+      level.arrows.length >= 25,
+      `S${index} only had ${level.arrows.length} arrows`,
+    );
+  }
+});
+
+check('few arrows can escape on the opening move', () => {
+  for (const index of [1, 2, 40, 200, 1200]) {
+    const level = generateSLevel(index);
+    const open = escapableArrowIds(createBoardState(level)).length;
+
+    assert(open > 0, `S${index} has no opening move at all`);
+    assert(
+      open <= 2,
+      `S${index} opened with ${open} free moves; at most two are allowed`,
+    );
+  }
+});
+
+check('gap fillers may sit on the rim, but they do not take over the board', () => {
+  const isRimStub = (
+    arrow: { cells: readonly { row: number; col: number }[]; direction: string },
+    rows: number,
+    cols: number,
+  ): boolean => {
+    if (arrow.cells.length > 4) return false;
+    const head = arrow.cells[arrow.cells.length - 1];
+    if (arrow.direction === 'up' && head.row <= 2) return true;
+    if (arrow.direction === 'down' && head.row >= rows - 3) return true;
+    if (arrow.direction === 'left' && head.col <= 2) return true;
+    if (arrow.direction === 'right' && head.col >= cols - 3) return true;
+    return false;
+  };
+
+  for (const index of [1, 2, 40, 200]) {
+    const level = generateSLevel(index);
+    const stubs = level.arrows.filter((a) =>
+      isRimStub(a, level.grid.rows, level.grid.cols),
+    );
+    assert(
+      stubs.length < level.arrows.length * 0.12,
+      `S${index} had ${stubs.length} rim stubs out of ${level.arrows.length} arrows`,
+    );
+  }
+});
+
+check('edge arrows usually have to slide, not hop straight off', () => {
+  const pointsStraightOff = (
+    arrow: { cells: readonly { row: number; col: number }[]; direction: 'up' | 'down' | 'left' | 'right' },
+    matrix: readonly (readonly number[])[],
+  ): boolean => {
+    const head = arrow.cells[arrow.cells.length - 1];
+    const delta = DIRECTION_DELTA[arrow.direction];
+    const row = head.row + delta.row;
+    const col = head.col + delta.col;
+    if (row < 0 || col < 0 || row >= matrix.length || col >= (matrix[0]?.length ?? 0)) {
+      return true;
+    }
+    return matrix[row][col] !== CELL_FLOOR;
+  };
+
+  for (const index of [1, 2, 40, 200]) {
+    const level = generateSLevel(index);
+    const easy = level.arrows.filter((arrow) =>
+      pointsStraightOff(arrow, level.grid.matrix),
+    );
+    assert(
+      easy.length < level.arrows.length * 0.28,
+      `S${index} had ${easy.length} of ${level.arrows.length} arrows pointing straight off the board`,
+    );
+  }
+});
+
+const fillRatio = (level: { grid: { matrix: readonly (readonly number[])[] }; arrows: readonly { cells: readonly unknown[] }[] }): number => {
+  const floor = level.grid.matrix.flat().filter((cell) => cell === CELL_FLOOR).length;
+  const covered = level.arrows.reduce((sum, arrow) => sum + arrow.cells.length, 0);
+  return covered / floor;
+};
+
+check('S-levels fill nearly the whole silhouette', () => {
+  for (const index of [1, 2, 40, 200, 1200]) {
+    const level = generateSLevel(index);
+    const fill = fillRatio(level);
+    const minFill = 0.95;
+    assert(fill >= minFill, `S${index} only filled ${(fill * 100).toFixed(1)}% of the board`);
+  }
+});
+
+check('some arrows are long and winding, without swallowing the board', () => {
+  const turns = (cells: readonly { row: number; col: number }[]): number => {
+    let count = 0;
+    for (let i = 2; i < cells.length; i++) {
+      const d1r = cells[i - 1].row - cells[i - 2].row;
+      const d1c = cells[i - 1].col - cells[i - 2].col;
+      const d2r = cells[i].row - cells[i - 1].row;
+      const d2c = cells[i].col - cells[i - 1].col;
+      if (d1r !== d2r || d1c !== d2c) count++;
+    }
+    return count;
+  };
+
+  const longestStraight = (cells: readonly { row: number; col: number }[]): number => {
+    let best = 1;
+    let run = 1;
+    for (let i = 2; i < cells.length; i++) {
+      const d1r = cells[i - 1].row - cells[i - 2].row;
+      const d1c = cells[i - 1].col - cells[i - 2].col;
+      const d2r = cells[i].row - cells[i - 1].row;
+      const d2c = cells[i].col - cells[i - 1].col;
+      if (d1r === d2r && d1c === d2c) {
+        run += 1;
+        if (run > best) best = run;
+      } else {
+        run = 1;
+      }
+    }
+    return best;
+  };
+
+  for (const index of [1, 5, 77, 200]) {
+    const level = generateSLevel(index);
+    const lengths = level.arrows.map((a) => a.cells.length);
+    const winding = level.arrows.filter((a) => a.cells.length >= 12 && turns(a.cells) >= 3);
+    const short = lengths.filter((len) => len <= 3).length;
+    const avg = lengths.reduce((sum, len) => sum + len, 0) / lengths.length;
+    const long = level.arrows.filter((a) => a.cells.length >= 10);
+    const stripes = long.filter((a) => longestStraight(a.cells) > 8);
+    assert(
+      winding.length >= 2,
+      `S${index} only had ${winding.length} winding arrows (need a handful, not none)`,
+    );
+    assert(
+      short / lengths.length <= 0.24,
+      `S${index} still has ${short} tiny arrows out of ${lengths.length}`,
+    );
+    assert(avg >= 6, `S${index} average length ${avg.toFixed(1)} is too stubby`);
+    assert(
+      Math.max(...lengths) >= 16,
+      `S${index} produced no really long arrow`,
+    );
+    assert(
+      stripes.length <= Math.max(1, Math.floor(long.length * 0.2)),
+      `S${index} still has ${stripes.length} long-parallel arrows out of ${long.length}`,
+    );
+  }
+});
+
+check('some arrows lock more than one escape path', () => {
+  const level = generateSLevel(40);
+  const live = new Set(escapableArrowIds(createBoardState(level)));
+  let masters = 0;
+  for (const arrow of level.arrows) {
+    const without = level.arrows.filter((other) => other.id !== arrow.id);
+    const occupancy = new OccupancyIndex(without);
+    let freed = 0;
+    for (const other of without) {
+      if (live.has(other.id)) continue;
+      if (resolveSlide(other, level.grid, occupancy).outcome === 'escaped') freed += 1;
+    }
+    if (freed >= 2) masters += 1;
+  }
+  assert(masters >= 1, `S40 had no arrows that locked two or more paths`);
 });
 
 check('S-levels stay dense enough to read as hard', () => {
@@ -125,10 +419,158 @@ check('custom board silhouettes are respected', () => {
   }
 });
 
-check('sample curated level parses and is solvable', () => {
-  const level = parseLevel(sampleCuratedLevel);
-  assert(level.source === 'curated', 'sample should be a curated level');
-  assert(isSolvable(level), 'sample level is not solvable');
+check('the ending-test demo is a dense 7×7 solvable board', () => {
+  const parsed = parseLevel(DEMO_ENDING_LEVEL);
+  assert(parsed.grid.rows === 9 && parsed.grid.cols === 9, 'demo stores a 7×7 playable board plus a pass-through ring');
+  assert(parsed.arrows.length >= 12, 'demo should have enough arrows to miss a few');
+  assert(isSolvable(parsed), 'demo ending board is not solvable');
+});
+
+check('a bent arrow is judged only by its head ray', () => {
+  // Arrows snake, so a body cell sitting in another arrow's row must not block.
+  const level = parseLevel({
+    id: '900',
+    source: 'curated',
+    version: 1,
+    grid: {
+      rows: 5,
+      cols: 5,
+      matrix: [
+        [1, 1, 1, 1, 1],
+        [1, 0, 0, 0, 1],
+        [1, 0, 0, 0, 1],
+        [1, 0, 0, 0, 1],
+        [1, 1, 1, 1, 1],
+      ],
+    },
+    arrows: [
+      // Bent arrow: tail at (3,1), turns up, head at (1,2) pointing up.
+      {
+        id: 'bent',
+        cells: [
+          { row: 3, col: 1 },
+          { row: 2, col: 1 },
+          { row: 2, col: 2 },
+          { row: 1, col: 2 },
+        ],
+        direction: 'up',
+      },
+      // Sits in row 3, which the bent arrow's tail occupies but never sweeps.
+      { id: 'other', cells: [{ row: 3, col: 2 }, { row: 3, col: 3 }], direction: 'right' },
+    ],
+    metadata: { arrowCount: 2 },
+  });
+
+  const bent = level.arrows[0];
+  const result = resolveSlide(bent, level.grid, new OccupancyIndex(level.arrows));
+  assert(
+    result.outcome === 'escaped',
+    'bent arrow with a clear head ray should escape despite a neighbour in its tail row',
+  );
+  assert(
+    result.distance === result.headSteps + bent.cells.length - 1,
+    'escape distance must include the body following the head',
+  );
+});
+
+check('a blocked tap costs exactly one life, and three end the run', () => {
+  const level = parseLevel({
+    id: '903',
+    source: 'curated',
+    version: 1,
+    grid: {
+      rows: 4,
+      cols: 5,
+      matrix: [
+        [1, 1, 1, 1, 1],
+        [1, 0, 0, 0, 1],
+        [1, 0, 0, 0, 1],
+        [1, 1, 1, 1, 1],
+      ],
+    },
+    arrows: [
+      { id: 'mover', cells: [{ row: 1, col: 1 }, { row: 1, col: 2 }], direction: 'right' },
+      { id: 'wall', cells: [{ row: 1, col: 3 }, { row: 2, col: 3 }], direction: 'down' },
+    ],
+    metadata: { arrowCount: 2 },
+  });
+
+  let state = createBoardState(level);
+  assert(state.lives === MAX_LIVES, 'a fresh board starts on full lives');
+
+  for (let attempt = 1; attempt <= MAX_LIVES; attempt++) {
+    const resolution = applyTap(state, 'mover');
+    assert(resolution !== null, `tap ${attempt} should resolve`);
+    assert(resolution!.result.outcome === 'blocked', `tap ${attempt} should be blocked`);
+    state = resolution!.nextState;
+    assert(
+      state.lives === MAX_LIVES - attempt,
+      `after ${attempt} blocked taps lives should be ${MAX_LIVES - attempt}, got ${state.lives}`,
+    );
+  }
+
+  assert(state.status === 'lost', 'running out of lives should end the run');
+  assert(applyTap(state, 'mover') === null, 'a finished board ignores further taps');
+});
+
+check('parser rejects an arrowhead that is not on a straight neck', () => {
+  let rejected = false;
+  try {
+    parseLevel({
+      id: '902',
+      source: 'curated',
+      version: 1,
+      grid: {
+        rows: 3,
+        cols: 4,
+        matrix: [
+          [1, 1, 1, 1],
+          [1, 0, 0, 1],
+          [1, 1, 1, 1],
+        ],
+      },
+      // Cells run rightward but the arrow claims to point up.
+      arrows: [
+        { id: 'bad', cells: [{ row: 1, col: 1 }, { row: 1, col: 2 }], direction: 'up' },
+      ],
+      metadata: { arrowCount: 1 },
+    });
+  } catch {
+    rejected = true;
+  }
+  assert(rejected, 'an off-axis arrowhead should be rejected');
+});
+
+check('an arrow blocked directly ahead recoils', () => {
+  const level = parseLevel({
+    id: '901',
+    source: 'curated',
+    version: 1,
+    grid: {
+      rows: 4,
+      cols: 5,
+      matrix: [
+        [1, 1, 1, 1, 1],
+        [1, 0, 0, 0, 1],
+        [1, 0, 0, 0, 1],
+        [1, 1, 1, 1, 1],
+      ],
+    },
+    arrows: [
+      { id: 'mover', cells: [{ row: 1, col: 1 }, { row: 1, col: 2 }], direction: 'right' },
+      { id: 'wall', cells: [{ row: 1, col: 3 }, { row: 2, col: 3 }], direction: 'down' },
+    ],
+    metadata: { arrowCount: 2 },
+  });
+
+  const result = resolveSlide(
+    level.arrows[0],
+    level.grid,
+    new OccupancyIndex(level.arrows),
+  );
+  assert(result.outcome === 'blocked', 'arrow should be blocked');
+  assert(result.blockedBy === 'wall', `expected block by wall, got ${result.blockedBy}`);
+  assert(result.distance === 0, `expected no free travel, got ${result.distance}`);
 });
 
 check('parser rejects overlapping arrows', () => {

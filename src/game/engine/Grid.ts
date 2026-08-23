@@ -14,7 +14,7 @@ import {
 export class OccupancyIndex {
   private readonly map = new Map<string, string>();
 
-  constructor(arrows: ArrowDefinition[]) {
+  constructor(arrows: readonly ArrowDefinition[]) {
     for (const arrow of arrows) {
       for (const cell of arrow.cells) {
         this.map.set(cellKey(cell), arrow.id);

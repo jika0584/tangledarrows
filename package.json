@@ -11,9 +11,12 @@
     "expo-dev-client": "~57.0.12",
     "expo-file-system": "~57.0.4",
     "expo-linking": "~57.0.6",
+    "expo-navigation-bar": "~57.0.2",
     "expo-router": "~57.0.13",
+    "expo-splash-screen": "~57.0.7",
     "expo-sqlite": "~57.0.1",
     "expo-status-bar": "~57.0.1",
+    "expo-updates": "~57.0.15",
     "react": "19.2.3",
     "react-native": "0.86.2",
     "react-native-gesture-handler": "~2.32.0",
@@ -25,10 +28,18 @@
   },
   "devDependencies": {
     "@babel/core": "^7.29.7",
+    "@types/node": "^26.2.0",
     "@types/react": "~19.2.2",
+    "@types/react-dom": "^19.2.4",
+    "@vitejs/plugin-react": "^6.0.5",
     "babel-preset-expo": "^57.0.7",
+    "eas-cli": "^22.0.0",
+    "electron": "^43.4.0",
+    "react-dom": "^19.2.3",
     "tsx": "^4.23.12",
-    "typescript": "~6.0.3"
+    "typescript": "~6.0.3",
+    "vite": "^8.2.1",
+    "vite-plugin-electron": "^1.1.1"
   },
   "scripts": {
     "start": "expo start --dev-client",
@@ -37,9 +48,16 @@
     "web": "expo start --web",
     "build:dev": "eas build --profile development --platform android",
     "build:preview": "eas build --profile preview --platform android",
+    "build:apk": "eas build --profile preview --platform android",
     "build:prod": "eas build --profile production --platform android",
+    "update:preview": "eas update --channel preview --platform android --environment preview",
+    "update:prod": "eas update --channel production --platform android --environment production",
     "typecheck": "tsc --noEmit",
-    "test:levels": "tsx src/procedural/__tests__/SLevelGenerator.test.ts"
+    "test:levels": "tsx src/procedural/__tests__/SLevelGenerator.test.ts && tsx src/procedural/__tests__/CuratedGenerator.test.ts && tsx src/procedural/__tests__/shapeFromImage.test.ts && tsx src/procedural/__tests__/editArrows.test.ts && tsx src/store/__tests__/campaignCatchUp.test.ts && tsx src/game/engine/__tests__/Solution.test.ts",
+    "gen:levels": "tsx scripts/generateShapedLevels.ts",
+    "px": "tsx tools/px/cli.ts",
+    "px:ui": "vite --config tools/px-ui/vite.config.ts",
+    "px:exe": "C:\\Windows\\Microsoft.NET\\Framework64\\v4.0.30319\\csc.exe /nologo /t:exe /out:px.exe tools\\px\\launcher.cs"
   },
   "private": true
 }

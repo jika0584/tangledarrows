@@ -1,8 +1,22 @@
 import { LevelGrid } from '../../levels/types';
 import { BoardLayout } from './ArrowPath';
 
-export const MIN_ZOOM = 0.6;
-export const MAX_ZOOM = 4;
+/** How far out pinch can go. 1 = whole board fitted; lower = smaller on screen. */
+export const MIN_ZOOM = 0.22;
+
+/**
+ * Zoom 1 fits the whole board on screen, so the ceiling has to cover the
+ * largest boards: a 60-wide grid fitted to a phone leaves cells a few pixels
+ * across, and the player needs to get close enough to read and tap one.
+ */
+export const MAX_ZOOM = 9;
+
+/**
+ * Pinch scale is raised to this power before being applied. Below 1 it damps
+ * the gesture, so a given finger spread changes the zoom less than the raw
+ * ratio would — the difference between "twitchy" and "controllable".
+ */
+export const ZOOM_DAMPING = 0.8;
 
 export interface Viewport {
   width: number;
@@ -42,8 +56,15 @@ export function clampZoom(value: number): number {
 }
 
 /**
- * Keeps the board from being panned entirely off-screen. Allows generous
- * overscroll at high zoom so edges of large boards remain reachable.
+ * How much of the viewport must still show the board. The rest of the puzzle
+ * may sit off that edge so a pinch on the rim can stay under the fingers.
+ */
+const EDGE_KEEP = 0.1;
+
+/**
+ * Lets the board travel until only a thin strip remains on screen. That is
+ * enough to zoom and pan at the rim without the camera yanking the puzzle
+ * back toward the centre.
  */
 export function clampTranslation(
   value: number,
@@ -52,8 +73,10 @@ export function clampTranslation(
   boardExtent: number,
 ): number {
   'worklet';
-  const scaledExtent = boardExtent * zoom;
-  const slack = Math.max(viewportExtent * 0.5, (scaledExtent - viewportExtent) / 2 + viewportExtent * 0.25);
+  const scaled = boardExtent * zoom;
+  const keepVisible = Math.min(scaled, viewportExtent) * EDGE_KEEP;
+  const slack = scaled / 2 + viewportExtent / 2 - keepVisible;
+  if (slack <= 0) return 0;
   return Math.min(slack, Math.max(-slack, value));
 }
 
