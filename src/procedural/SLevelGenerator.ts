@@ -15,6 +15,8 @@ import {
 } from '../levels/types';
 import { SeededRandom } from './SeededRandom';
 
+export type GenerationQuality = 'fast' | 'normal' | 'quality';
+
 export interface SLevelGeneratorOptions {
   /** 1-based S-level index (S1, S2, …). Also the default seed. */
   sLevelIndex: number;
@@ -51,6 +53,21 @@ export interface SLevelGeneratorOptions {
    * omit with `forceRandomize` to use the clock / CSPRNG.
    */
   randomSalt?: number;
+  /**
+   * Speed / density trade: fast finishes sooner; quality spends longer on teal+pink packing.
+   */
+  quality?: GenerationQuality;
+}
+
+interface QualityKnobs {
+  coreTarget: number;
+  packTarget: number;
+  fillTarget: number;
+  maxCrumbShare: number;
+  maxAttemptsCap: number;
+  saturationRetries: number;
+  packFailBudgetScale: number;
+  extraPackPasses: boolean;
 }
 
 interface OccupancyGrid {
@@ -67,6 +84,13 @@ interface HeadCandidate {
   blocks: boolean;
 }
 
+interface MacroBlock {
+  id: number;
+  row: number;
+  col: number;
+  radius: number;
+}
+
 /** Incremental pool of empty floor cells sitting on some arrow's escape ray. */
 interface RayCache {
   byId: Map<string, { cellSet: Set<string>; live: boolean; direction: Direction }>;
@@ -79,14 +103,17 @@ interface RayCache {
 const MIN_INTERIOR = 36;
 const MAX_INTERIOR = 60;
 
-const DEFAULT_S_DENSITY = 0.95;
-const FILL_TARGET = 0.99;
-/** Hole-packing keeps placing long snakes until the board is almost solid. */
-const PACK_TARGET = FILL_TARGET;
-/** Main reverse-construction must reach this before pink fillers take over. */
-const CORE_COVERAGE = 0.95;
+const CORE_COVERAGE = 0.88;
+const DEFAULT_S_DENSITY = CORE_COVERAGE;
+const FILL_TARGET = 0.95;
+/** Pink hole-packing stops here; leftover floor is purple crumbs. */
+const PACK_TARGET = 0.88;
 /** Immediately clickable arrows allowed at solve step 1. */
 const MAX_OPENING_MOVES = 2;
+/** Heads may sit this many cells past the block radius when it helps packing. */
+const HEAD_RADIUS_SLACK = 5;
+/** Soft border slack for body steps that stay near the home Voronoi face. */
+const FOREIGN_OVERLAP = 4;
 
 /** Grow until trapped or this length. Raised so blockers can reach across the board. */
 const DEFAULT_MAX_ARROW_LENGTH = 36;
@@ -108,15 +135,20 @@ const FIRST_ARROW_MIN = 12;
 
 const MIN_ARROWS = 35;
 
-const CORE_SATURATION_RETRIES = 40;
+const CORE_SATURATION_RETRIES = 80;
 const FILLER_QUICK_ATTEMPTS = 16;
 const FILLER_LONG_MIN = 6;
 const FILLER_LONG_MAX = 12;
-const FILLER_RELAX_MIN = 4;
+/** Shortest snake allowed when the pack pass relaxes — never below 5. */
+const FILLER_RELAX_MIN = 5;
+/** Pink tails may not keep growing past this — stops “length for length’s sake”. */
+const FILLER_TAIL_CAP = 14;
+/** Reject / heavily penalize steps that hug the snake’s own body (fake self-blocks). */
+const SELF_HUG_PENALTY = 520;
 
-/** 2-cell crumbs only, and only in pockets smaller than 3 cells. */
-const GAP_FILL_MAX_LENGTH = 2;
-const CRUMB_POCKET_MAX = 2;
+/** Board density above which final snakes hunt harder across the map. */
+const ENDGAME_DENSITY = 0.8;
+const ENDGAME_MAGNET_AMP = 3;
 
 /** Longest snake a pocket puzzle will try to grow. */
 const POCKET_SNAKE_MAX = 20;
@@ -144,7 +176,7 @@ const ZONE_BAN_PLACEMENTS = 2;
 /** A quadrant may not put more than this share of heads on one escape direction. */
 const DIR_QUOTA = 0.3;
 /** Do not enforce the quota until the quadrant has this many arrows. */
-const DIR_QUOTA_MIN = 5;
+const DIR_QUOTA_MIN = 3;
 /** Same-direction parallel adjacency (unzipping / spooning). */
 const SPOON_PENALTY = 800;
 
@@ -166,12 +198,18 @@ const HUNT_TURN_MARGIN = 40;
 const HUNT_MIN_GAP = 6;
 /** Reserve this many cells after the primary hit for extra ray hooks. */
 const HUNT_BRANCH_RESERVE = 8;
+const BRIDGE_PULL = 160;
+/** Keep a core body inside its home block; a short seam overlap is allowed. */
+const HOME_STAY = 110;
+const FOREIGN_STEP_PENALTY = 120;
 
 interface RayHunt {
   primary: Set<string>;
   primaryCells: GridCell[];
   bonus: Set<string>;
   focusAxis: 'h' | 'v' | null;
+  /** True when this hunt is a cross-block bridge after a round-robin jump. */
+  bridge: boolean;
   centerRow0: number;
   centerRow1: number;
   centerCol0: number;
@@ -188,18 +226,24 @@ interface RayHunt {
  * next two placements, so consecutive pieces jump to another quadrant. Target
  * rays are the oldest perpendicular unblocked escape (then a random
  * perpendicular, then any) so a new piece crosses traffic instead of
- * stacking a same-direction jam. Bodies refuse to run alongside a neighbour
- * that shares the same escape direction (anti-spoon). Each quadrant bans an
- * escape heading that already holds more than 30% of its heads, so fillers
- * cannot spam the nearest border. Scattered heads hunt the chosen ray across
- * the board, then keep growing to clip extra rays so one piece can lock
- * several paths. Tails prefer the middle of
- * the silhouette, so bodies knot in the centre instead of hugging the rim.
- * One forward pass builds the board; leftover holes are packed with long
- * fillers, then short plugs once density is past 95% or several attempts
- * miss. At most two arrows may be free on the first click. Heads sitting on
- * the rim may not point straight off the board except as a last-resort
- * two-cell crumb.
+ * stacking a same-direction jam. Core heads are soft-bordered into 2–7
+ * geographic macro-blocks and placed in round-robin micro-clusters of 1–5
+ * arrows, so generation never depletes one zone in a single visit. Heads
+ * stay near that block's origin (with a few cells of slack) and bodies prefer
+ * home territory; a tail may cross a neighbour so long as the previous arrow
+ * in that block did not. After each jump the first new piece hunts a nearby
+ * foreign-block ray. Bodies refuse to run alongside a neighbour that shares the
+ * same escape direction (anti-spoon). Each quadrant bans an escape heading
+ * that already holds more than 30% of its heads, so fillers cannot spam
+ * the nearest border. Scattered heads hunt the chosen ray across the
+ * board, then keep growing to clip extra rays so one piece can lock
+ * several paths. Tails prefer the middle of the silhouette, so bodies
+ * knot in the centre instead of hugging the rim. One forward pass builds
+ * the board; leftover holes are packed with pink fillers that still obey
+ * cheap-exit / direction / spoon rules, then a winding mop-up (≥5 cells)
+ * pushes density toward fillTarget — never tiny purple crumbs. At most two
+ * arrows may be free on the first click. Heads sitting on the rim may not
+ * point straight off the board.
  */
 export class SLevelGenerator {
   private rays: RayCache | null = null;
@@ -210,17 +254,33 @@ export class SLevelGenerator {
   private zoneDirTotals: number[] = [];
   private quotaActive = true;
   private spoonStrict = true;
+  /** Vein rule: reject snakes that carve pockets smaller than FILLER_RELAX_MIN. */
+  private enforceVein = true;
+  private macroBlocks: MacroBlock[] = [];
+  private macroRobinIndex = 0;
+  private activeBlockId: number | null = null;
+  private lastVisitedBlockId: number | null = null;
+  private lastCommittedBlockId: number | null = null;
+  private clusterBudget = 0;
+  private clusterPlaced = 0;
+  private pendingBridgeRay: Set<string> | null = null;
+  private bridgeHuntActive = false;
+  private macroRadiusCap = 12;
+  /** True when the last committed arrow in the active block crossed a border. */
+  private lastBlockCrossedBorder = false;
+  private quality: QualityKnobs = qualityKnobs('normal');
 
   generate(options: SLevelGeneratorOptions): Level {
     const { sLevelIndex } = options;
     const seed = resolveGenerationSeed(options);
+    this.quality = qualityKnobs(options.quality ?? 'quality');
 
     const matrix = options.shapeMatrix
       ? options.shapeMatrix.map((row) => [...row])
       : this.createBorderedMatrix(this.resolveInteriorSize(sLevelIndex, options.gridSize));
 
     const floorCells = this.countFloorCells(matrix);
-    const density = Math.max(options.targetDensity ?? DEFAULT_S_DENSITY, CORE_COVERAGE);
+    const density = options.targetDensity ?? Math.min(DEFAULT_S_DENSITY, this.quality.coreTarget);
     const maxLen = options.maxArrowLength ?? DEFAULT_MAX_ARROW_LENGTH;
     const minLen = Math.min(DEFAULT_MIN_ARROW_LENGTH, maxLen);
     const maxTail = options.maxTailLength ?? DEFAULT_MAX_TAIL_LENGTH;
@@ -237,29 +297,8 @@ export class SLevelGenerator {
       maxTail,
       minArrows,
     });
-    let best = built;
-    let bestFill = floorCells === 0 ? 1 : this.totalCells(best.level.arrows) / floorCells;
-    const retryBudget = bestFill < CORE_COVERAGE ? (floorCells <= 2200 ? 2 : 4) : 0;
-    for (let retry = 1; retry <= retryBudget && bestFill < CORE_COVERAGE; retry++) {
-      const alt = this.buildAttempt({
-        sLevelIndex,
-        seed: mixSeed(seed, retry * 0x9e3779b1),
-        matrix: matrix.map((row) => [...row]),
-        floorCells,
-        density,
-        maxLen,
-        minLen,
-        maxTail,
-        minArrows,
-      });
-      const fill = floorCells === 0 ? 1 : this.totalCells(alt.level.arrows) / floorCells;
-      if (fill > bestFill) {
-        best = alt;
-        bestFill = fill;
-      }
-    }
-    best.level.metadata.seed = seed;
-    return best.level;
+    built.level.metadata.seed = seed;
+    return built.level;
   }
 
   private buildAttempt(args: {
@@ -279,7 +318,7 @@ export class SLevelGenerator {
     const rows = matrix.length;
     const cols = matrix[0].length;
     const occupancy = this.createOccupancy(rows, cols);
-    const targetOccupiedCells = Math.floor(floorCells * density);
+    const targetOccupiedCells = Math.floor(floorCells * Math.min(density, this.quality.coreTarget));
     this.rays = this.emptyRayCache();
     this.zoneBanActive = true;
     this.bannedZone = null;
@@ -287,13 +326,21 @@ export class SLevelGenerator {
     this.resetDirectionQuota();
     this.quotaActive = true;
     this.spoonStrict = true;
+    this.enforceVein = true;
+    this.lastBlockCrossedBorder = false;
+    this.setupMacroBlocks(occupancy, matrix, rng);
 
     const arrows: ArrowDefinition[] = [];
     let nextIndex = 0;
 
-    const maxAttempts = Math.max(240, Math.min(900, floorCells * 4));
+    const maxAttempts = Math.max(
+      120,
+      Math.min(this.quality.maxAttemptsCap, Math.floor(floorCells * (this.quality.maxAttemptsCap > 400 ? 4 : 2.2))),
+    );
     let attempts = 0;
     let consecutiveFailures = 0;
+    let visitFails = 0;
+    const saturation = this.quality.saturationRetries;
 
     while (
       (this.totalCells(arrows) < targetOccupiedCells || arrows.length < minArrows) &&
@@ -304,7 +351,17 @@ export class SLevelGenerator {
       const requireBlock = !isFirst && consecutiveFailures < 12;
       const frontierOnly = consecutiveFailures < 16;
       this.zoneBanActive = consecutiveFailures < 4;
-      this.quotaActive = consecutiveFailures < 10;
+      this.quotaActive = true;
+      const jumped = this.rollMacroCluster(rng, arrows, occupancy, matrix, visitFails);
+      if (jumped) {
+        visitFails = 0;
+        this.lastBlockCrossedBorder = false;
+      }
+      if (visitFails > 0) this.expandActiveBlockRadius();
+      const enforceMacro = this.activeBlockId !== null && visitFails < (this.quality.packFailBudgetScale < 0.65 ? 2 : 6);
+      const bridging =
+        enforceMacro && visitFails < 3 && !!this.pendingBridgeRay && this.pendingBridgeRay.size > 0;
+      this.bridgeHuntActive = bridging;
       const reach = this.snakeReachCap(occupancy, maxLen);
       const snakeMax = this.rollSnakeMax(rng, reach, isFirst, true);
       const snakeMin = isFirst
@@ -319,20 +376,32 @@ export class SLevelGenerator {
         snakeMax,
         snakeMin,
         rng,
-        { requireBlock, frontierOnly, allowCheap: consecutiveFailures >= 20, allowLive: false },
+        {
+          requireBlock: bridging || requireBlock,
+          frontierOnly: bridging ? false : frontierOnly,
+          allowCheap: consecutiveFailures >= 20,
+          allowLive: false,
+          hunt: true,
+          blockId: enforceMacro ? this.activeBlockId ?? undefined : undefined,
+          bridgeRay: bridging ? this.pendingBridgeRay ?? undefined : undefined,
+        },
       );
 
       if (!candidate) {
-        if (++consecutiveFailures >= CORE_SATURATION_RETRIES) break;
+        visitFails++;
+        if (++consecutiveFailures >= saturation) break;
         continue;
       }
       if (!this.tryCommit(arrows, occupancy, matrix, candidate)) {
-        if (++consecutiveFailures >= CORE_SATURATION_RETRIES) break;
+        visitFails++;
+        if (++consecutiveFailures >= saturation) break;
         continue;
       }
       this.noteHeadZone(candidate, occupancy);
+      this.noteMacroCommit(candidate);
       nextIndex++;
       consecutiveFailures = 0;
+      visitFails = 0;
     }
 
     this.growTails(arrows, occupancy, matrix, Math.max(maxTail, this.snakeReachCap(occupancy, maxLen)), rng);
@@ -341,15 +410,23 @@ export class SLevelGenerator {
 
     this.packHoles(arrows, occupancy, matrix, rng, maxLen, maxTail);
     this.fillEmptyRegions(arrows, occupancy, matrix, rng, maxTail, 0, maxLen);
-    this.fillGaps(arrows, occupancy, matrix, rng, maxTail);
-    this.packHoles(arrows, occupancy, matrix, rng, maxLen, maxTail, arrows.length + 80_000);
-    this.fillGaps(arrows, occupancy, matrix, rng, maxTail, arrows.length + 90_000);
-    this.densify(arrows, occupancy, matrix, rng, maxLen, maxTail, arrows.length + 100_000);
-
+    if (this.quality.extraPackPasses) {
+      this.packHoles(arrows, occupancy, matrix, rng, maxLen, maxTail, arrows.length + 80_000);
+      this.fillEmptyRegions(arrows, occupancy, matrix, rng, maxTail, arrows.length + 82_000, maxLen);
+    }
+    this.fillWindingGaps(arrows, occupancy, matrix, rng, maxTail, arrows.length + 90_000);
+    if (floorCells > 0 && this.totalCells(arrows) / floorCells < this.quality.fillTarget - 0.02) {
+      this.fillWindingGaps(arrows, occupancy, matrix, rng, maxTail, arrows.length + 95_000);
+    }
+    if (floorCells > 0 && this.totalCells(arrows) / floorCells < this.quality.fillTarget - 0.03) {
+      this.rescueDeadVoids(arrows, occupancy, matrix, rng, maxLen, maxTail);
+    }
     this.popUntilSolvable(arrows, occupancy, matrix);
+    this.clampOpenings(arrows, occupancy, matrix, rng);
     const occupiedCells = this.totalCells(arrows);
     const grid: LevelGrid = { rows, cols, matrix };
     const solved = this.removalOrder(arrows, occupancy, matrix);
+    this.assignSolveIndices(arrows, solved ?? undefined);
     const solutionOrder = (solved ?? [...arrows].reverse()).map((a) => a.id);
     this.rays = null;
 
@@ -377,6 +454,7 @@ export class SLevelGenerator {
    * Existing arrows are kept; new pieces get ids that will not collide with them.
    */
   fillVacancies(level: Level, seed?: number): Level {
+    this.quality = qualityKnobs('normal');
     const arrows = level.arrows.map((arrow) => ({
       ...arrow,
       cells: arrow.cells.map((cell) => ({ ...cell })),
@@ -391,28 +469,62 @@ export class SLevelGenerator {
     this.bannedRemaining = 0;
     this.resetDirectionQuota();
     for (const arrow of arrows) this.recordDirectionQuota(arrow, occupancy);
-    this.quotaActive = true;
+    this.quotaActive = false;
+    this.spoonStrict = false;
+    this.macroBlocks = [];
+    this.macroRobinIndex = 0;
+    this.activeBlockId = null;
+    this.lastVisitedBlockId = null;
+    this.lastCommittedBlockId = null;
+    this.clusterBudget = 0;
+    this.clusterPlaced = 0;
+    this.pendingBridgeRay = null;
+    this.bridgeHuntActive = false;
 
     const rng = new SeededRandom(seed ?? (level.metadata.seed ?? 1) * 1_000_003 + arrows.length + 17);
     const serial = arrows.length + 10_000;
     this.packHoles(arrows, occupancy, matrix, rng, DEFAULT_MAX_ARROW_LENGTH, DEFAULT_MAX_TAIL_LENGTH, serial);
     this.fillEmptyRegions(arrows, occupancy, matrix, rng, DEFAULT_MAX_TAIL_LENGTH, serial, DEFAULT_MAX_ARROW_LENGTH);
-    this.fillGaps(arrows, occupancy, matrix, rng, DEFAULT_MAX_TAIL_LENGTH, serial);
-    this.densify(
+    this.fillWindingGaps(
       arrows,
       occupancy,
       matrix,
       rng,
-      DEFAULT_MAX_ARROW_LENGTH,
       DEFAULT_MAX_TAIL_LENGTH,
       serial + 20_000,
     );
+    if (this.countFloorCells(matrix) > 0) {
+      let dens = this.totalCells(arrows) / this.countFloorCells(matrix);
+      if (dens < this.quality.fillTarget - 0.02) {
+        this.fillWindingGaps(
+          arrows,
+          occupancy,
+          matrix,
+          rng,
+          DEFAULT_MAX_TAIL_LENGTH,
+          serial + 25_000,
+        );
+        dens = this.totalCells(arrows) / this.countFloorCells(matrix);
+      }
+      if (dens < this.quality.fillTarget - 0.03) {
+        this.rescueDeadVoids(
+          arrows,
+          occupancy,
+          matrix,
+          rng,
+          DEFAULT_MAX_ARROW_LENGTH,
+          DEFAULT_MAX_TAIL_LENGTH,
+        );
+      }
+    }
     this.popUntilSolvable(arrows, occupancy, matrix);
+    this.clampOpenings(arrows, occupancy, matrix, rng);
     this.rays = null;
 
     const occupiedCells = this.totalCells(arrows);
     const floorCells = this.countFloorCells(matrix);
     const solved = this.removalOrder(arrows, occupancy, matrix, rng);
+    this.assignSolveIndices(arrows, solved ?? undefined);
 
     return {
       ...level,
@@ -428,10 +540,9 @@ export class SLevelGenerator {
   }
 
   /**
-   * Leftover holes: try long interlocking snakes that block existing rays.
-   * After 95% fill or several misses, drop to short 4-cell plugs with no blocking.
-   * `force` keeps packing locally (no hunt, no block requirement, 2-cell floor)
-   * so a late densify pass can still push coverage to 95%.
+   * Pink hole-packing: interlocking snakes that still obey cheap-exit, direction
+   * quota, spoon, and macro-block rules. Aims for packTarget; fillWindingGaps
+   * then pushes toward fillTarget with min-length winding snakes (no crumbs).
    */
   private packHoles(
     arrows: ArrowDefinition[],
@@ -441,8 +552,6 @@ export class SLevelGenerator {
     maxLen: number,
     maxTail: number,
     startIndex?: number,
-    force = false,
-    micro = false,
   ): void {
     const floor = this.countFloorCells(matrix);
     if (floor === 0) return;
@@ -450,37 +559,47 @@ export class SLevelGenerator {
     this.bannedZone = null;
     this.bannedRemaining = 0;
     const restoreSpoon = this.spoonStrict;
-    this.spoonStrict = false;
     const restoreQuota = this.quotaActive;
-    if (force) this.quotaActive = false;
+    const restoreVein = this.enforceVein;
+    // Vein is a core-pass rule; packing must be free to close leftover highways.
+    this.enforceVein = false;
+    const packGoal = Math.ceil(floor * this.quality.packTarget);
+
+    for (const block of this.macroBlocks) {
+      block.radius = Math.min(this.macroRadiusCap, Math.max(block.radius, Math.floor(this.macroRadiusCap * 0.7)));
+    }
 
     let nextIndex = startIndex ?? arrows.length;
     let longFails = 0;
-    let relaxed = micro || (force && this.totalCells(arrows) / floor >= 0.93);
+    let relaxed = false;
+    const failBudget = Math.max(
+      28,
+      Math.min(
+        Math.floor(120 * this.quality.packFailBudgetScale),
+        Math.floor((floor / 16) * this.quality.packFailBudgetScale),
+      ),
+    );
 
-    while (this.totalCells(arrows) / floor < PACK_TARGET) {
+    while (this.totalCells(arrows) < packGoal) {
       const density = this.totalCells(arrows) / floor;
-      const empty = floor - this.totalCells(arrows);
-      const failBudget =
-        force || density < CORE_COVERAGE
-          ? Math.min(160, Math.max(FILLER_QUICK_ATTEMPTS * 3, Math.floor(empty / 4)))
-          : FILLER_QUICK_ATTEMPTS;
-      if (!relaxed && (density > 0.97 || longFails >= failBudget)) {
+      if (!relaxed && longFails >= failBudget) {
         relaxed = true;
         longFails = 0;
       }
-      this.quotaActive = force ? false : !relaxed;
+      // Pink keeps spoon + quota until the very last stretch so it cannot
+      // dump a rim of same-direction free clicks.
+      this.spoonStrict = !(relaxed && density >= this.quality.packTarget - 0.02);
+      this.quotaActive = !(relaxed && density >= this.quality.packTarget - 0.02);
+      const closing = density >= this.quality.packTarget - 0.04;
+      const useBlock =
+        !relaxed && this.quality.packFailBudgetScale >= 0.65
+          ? this.pickFillerBlockId(occupancy, matrix, rng)
+          : undefined;
 
       const snakeMax = relaxed
-        ? micro
-          ? GAP_FILL_MAX_LENGTH
-          : Math.max(FILLER_RELAX_MIN, 4)
+        ? rng.nextInt(FILLER_RELAX_MIN, FILLER_LONG_MAX)
         : rng.nextInt(FILLER_LONG_MIN, FILLER_LONG_MAX);
-      const minLen = relaxed
-        ? micro
-          ? GAP_FILL_MAX_LENGTH
-          : FILLER_RELAX_MIN
-        : Math.min(FILLER_LONG_MIN, snakeMax);
+      const minLen = relaxed ? FILLER_RELAX_MIN : Math.min(FILLER_LONG_MIN, snakeMax);
       const candidate = this.tryPlaceSnake(
         occupancy,
         matrix,
@@ -490,12 +609,14 @@ export class SLevelGenerator {
         minLen,
         rng,
         {
-          requireBlock: !relaxed,
-          frontierOnly: !relaxed && !force && density >= 0.9,
-          allowCheap: force || relaxed || density < 0.94,
-          allowLive: force || density < 0.95,
-          hunt: density < CORE_COVERAGE,
-          preferPerp: !force,
+          requireBlock: !relaxed && this.quality.packFailBudgetScale >= 0.65,
+          frontierOnly: !relaxed && !closing,
+          allowCheap: relaxed,
+          allowLive: false,
+          hunt: !relaxed && !closing && this.quality.packFailBudgetScale >= 0.65,
+          preferPerp: true,
+          blockId: useBlock,
+          avoidSelfHug: true,
         },
       );
       if (!candidate) {
@@ -503,7 +624,27 @@ export class SLevelGenerator {
         if (relaxed && longFails >= failBudget) break;
         continue;
       }
-      const placed = { ...candidate, role: 'filler' as const };
+      const head = candidate.cells[candidate.cells.length - 1];
+      const lane = this.laneLength(
+        occupancy,
+        matrix,
+        head.row,
+        head.col,
+        DIRECTION_DELTA[candidate.direction],
+      );
+      if (candidate.cells.length <= 4 && this.isCheapExit(lane)) {
+        longFails++;
+        if (relaxed && longFails >= failBudget) break;
+        continue;
+      }
+      const placed = {
+        ...candidate,
+        role: 'filler' as const,
+        blockId:
+          candidate.blockId ??
+          useBlock ??
+          this.cellMacroBlockId(head),
+      };
       if (!this.tryCommit(arrows, occupancy, matrix, placed)) {
         longFails++;
         if (relaxed && longFails >= failBudget) break;
@@ -513,124 +654,277 @@ export class SLevelGenerator {
       longFails = 0;
     }
 
-    this.growTails(arrows, occupancy, matrix, Math.max(maxTail, this.snakeReachCap(occupancy, maxLen)), rng);
+    this.growTails(arrows, occupancy, matrix, Math.max(maxTail, this.snakeReachCap(occupancy, maxLen)), rng, false);
     this.rebuildAllRays(arrows, occupancy, matrix);
     this.spoonStrict = restoreSpoon;
     this.quotaActive = restoreQuota;
+    this.enforceVein = restoreVein;
   }
 
   /**
-   * Extra packing rounds until the silhouette is at least 95% covered.
-   * Quota and anti-spoon stay off so leftover 1-wide channels can still fill.
+   * Final mop-up without crumbs: place winding snakes (≥ FILLER_RELAX_MIN) until
+   * fillTarget. Vein/spoon/quota off so leftover highways can still close.
    */
-  private densify(
+  private fillWindingGaps(
+    arrows: ArrowDefinition[],
+    occupancy: OccupancyGrid,
+    matrix: CellValue[][],
+    rng: SeededRandom,
+    maxTail: number,
+    startIndex = 0,
+  ): void {
+    const floor = this.countFloorCells(matrix);
+    if (floor === 0) return;
+    const restoreSpoon = this.spoonStrict;
+    const restoreQuota = this.quotaActive;
+    const restoreVein = this.enforceVein;
+    this.spoonStrict = false;
+    this.quotaActive = false;
+    this.enforceVein = false;
+
+    let nextIndex = startIndex;
+    let fails = 0;
+    const failBudget = Math.max(
+      120,
+      Math.min(360, Math.floor((floor / 4) * Math.max(1, this.quality.packFailBudgetScale))),
+    );
+    const fillGoal = Math.ceil(floor * this.quality.fillTarget);
+    const reach = this.snakeReachCap(occupancy, Math.max(maxTail, POCKET_SNAKE_MAX));
+
+    while (this.totalCells(arrows) < fillGoal && fails < failBudget) {
+      if (floor - this.totalCells(arrows) < FILLER_RELAX_MIN) break;
+
+      const loose = fails > failBudget * 0.12;
+      const snakeMax = rng.nextInt(FILLER_RELAX_MIN, Math.min(FILLER_LONG_MAX + 8, reach));
+      let candidate = this.tryPlaceSnake(
+        occupancy,
+        matrix,
+        arrows,
+        nextIndex,
+        snakeMax,
+        FILLER_RELAX_MIN,
+        rng,
+        {
+          // Prefer free placement for mop-up; only the first few tries nest on rays.
+          requireBlock: fails < 8 && !loose,
+          frontierOnly: false,
+          allowCheap: true,
+          allowLive: false,
+          hunt: true,
+          preferPerp: true,
+          avoidSelfHug: true,
+        },
+      );
+
+      if (!candidate || candidate.cells.length < FILLER_RELAX_MIN) {
+        const regions = this.emptyRegions(occupancy, matrix)
+          .filter((region) => region.length >= FILLER_RELAX_MIN)
+          .sort((a, b) => b.length - a.length);
+        for (const region of regions.slice(0, 10)) {
+          const pocket = new Set(region.map((cell) => this.key(cell)));
+          const grown = this.tryPlacePocketSnake(
+            occupancy,
+            matrix,
+            pocket,
+            null,
+            nextIndex,
+            Math.min(POCKET_SNAKE_MAX, region.length),
+            FILLER_RELAX_MIN,
+            false,
+            new Set(),
+            rng,
+            arrows,
+            true,
+          );
+          if (grown && grown.cells.length >= FILLER_RELAX_MIN) {
+            candidate = grown;
+            break;
+          }
+        }
+      }
+
+      if (!candidate || candidate.cells.length < FILLER_RELAX_MIN) {
+        fails++;
+        continue;
+      }
+
+      const placed = {
+        ...candidate,
+        role: 'filler' as const,
+        blockId:
+          candidate.blockId ??
+          this.cellMacroBlockId(candidate.cells[candidate.cells.length - 1]),
+      };
+      if (!this.tryCommit(arrows, occupancy, matrix, placed)) {
+        fails++;
+        continue;
+      }
+      nextIndex++;
+      fails = Math.max(0, fails - 2);
+    }
+
+    this.growTails(arrows, occupancy, matrix, Math.max(maxTail, this.snakeReachCap(occupancy, 16)), rng, false);
+    this.rebuildAllRays(arrows, occupancy, matrix);
+    this.spoonStrict = restoreSpoon;
+    this.quotaActive = restoreQuota;
+    this.enforceVein = restoreVein;
+  }
+
+  /**
+   * Some leftover voids (≥5) admit no solvable plug — every candidate deadlocks
+   * the board. Peel nearby pink fillers that touch those voids, then re-pack.
+   */
+  private rescueDeadVoids(
     arrows: ArrowDefinition[],
     occupancy: OccupancyGrid,
     matrix: CellValue[][],
     rng: SeededRandom,
     maxLen: number,
     maxTail: number,
-    serial: number,
   ): void {
     const floor = this.countFloorCells(matrix);
     if (floor === 0) return;
-    const restoreQuota = this.quotaActive;
-    const restoreSpoon = this.spoonStrict;
-    this.quotaActive = false;
-    this.spoonStrict = false;
-    this.zoneBanActive = false;
+    const fillGoal = Math.ceil(floor * this.quality.fillTarget);
+    let rounds = 0;
+    const maxRounds = this.quality.extraPackPasses ? 3 : 2;
+    while (this.totalCells(arrows) < fillGoal && rounds < maxRounds) {
+      rounds++;
+      const dead = this.emptyRegions(occupancy, matrix)
+        .filter((region) => region.length >= FILLER_RELAX_MIN)
+        .sort((a, b) => b.length - a.length);
+      if (dead.length === 0) break;
 
-    let previous = -1;
-    for (let round = 0; round < 3; round++) {
-      const filled = this.totalCells(arrows);
-      if (filled / floor >= CORE_COVERAGE) break;
-      if (filled === previous) break;
-      previous = filled;
-      this.packHoles(arrows, occupancy, matrix, rng, maxLen, maxTail, serial + round * 25_000, true);
-      if (this.totalCells(arrows) / floor >= CORE_COVERAGE) break;
+      const touch = new Set<string>();
+      for (const region of dead.slice(0, 2)) {
+        for (const cell of region) {
+          touch.add(this.key(cell));
+          for (const step of [
+            { row: 1, col: 0 },
+            { row: -1, col: 0 },
+            { row: 0, col: 1 },
+            { row: 0, col: -1 },
+          ]) {
+            touch.add(this.key({ row: cell.row + step.row, col: cell.col + step.col }));
+          }
+        }
+      }
+
+      const victims: number[] = [];
+      for (let i = arrows.length - 1; i >= 0; i--) {
+        const arrow = arrows[i];
+        if (arrow.role !== 'filler' && arrow.role !== 'crumb') continue;
+        if (!arrow.cells.some((cell) => touch.has(this.key(cell)))) continue;
+        victims.push(i);
+        if (victims.length >= 4) break;
+      }
+      if (victims.length === 0) break;
+
+      for (const index of victims) {
+        const [removed] = arrows.splice(index, 1);
+        this.uncommitCells(occupancy, removed.cells);
+        this.recordDirectionQuota(removed, occupancy, -1);
+      }
+      this.rebuildAllRays(arrows, occupancy, matrix);
+      // Re-nest onto openings before free packing so rescue cannot leave 3+ lives.
+      this.clampOpenings(arrows, occupancy, matrix, rng);
+
+      const before = this.totalCells(arrows);
       this.fillEmptyRegions(
         arrows,
         occupancy,
         matrix,
         rng,
         maxTail,
-        serial + 8_000 + round * 25_000,
+        arrows.length + 72_000 + rounds * 1_000,
         maxLen,
       );
-      this.fillGaps(arrows, occupancy, matrix, rng, maxTail, serial + 16_000 + round * 25_000);
+      this.fillWindingGaps(
+        arrows,
+        occupancy,
+        matrix,
+        rng,
+        maxTail,
+        arrows.length + 74_000 + rounds * 1_000,
+      );
+      if (this.totalCells(arrows) <= before) break;
     }
-
-    if (this.totalCells(arrows) / floor < CORE_COVERAGE) {
-      this.packHoles(arrows, occupancy, matrix, rng, maxLen, maxTail, serial + 90_000, true, true);
-      this.fillGaps(arrows, occupancy, matrix, rng, maxTail, serial + 95_000);
-    }
-
-    this.quotaActive = restoreQuota;
-    this.spoonStrict = restoreSpoon;
   }
 
-  /**
-   * Final mop-up: 2-cell crumbs, and leftover 3–5 cell pockets as one snake.
-   */
-  private fillGaps(
+  /** Prefer nesting onto live rays until ≤ MAX_OPENING_MOVES free clicks. */
+  private clampOpenings(
     arrows: ArrowDefinition[],
     occupancy: OccupancyGrid,
     matrix: CellValue[][],
-    rng: SeededRandom,
-    maxTail: number,
-    startCrumb = 0,
+    rng?: SeededRandom,
   ): void {
-    const floor = this.countFloorCells(matrix);
-    if (floor === 0) return;
-
-    let crumbIndex = startCrumb;
-    let fillerIndex = startCrumb + 50_000;
-    const banned = new Set<string>();
-    const density = floor === 0 ? 1 : this.totalCells(arrows) / floor;
-    const liveRays = density >= 0.97 ? this.liveRayCells() : new Set<string>();
-    const regions = this.emptyRegions(occupancy, matrix);
-
-    for (const region of regions) {
-      const parts = this.offRayGroups(region, liveRays);
-      for (const part of parts) {
-        if (part.length < 2) continue;
-        const pocket = new Set(part.map((cell) => this.key(cell)));
-        if (part.length <= CRUMB_POCKET_MAX) {
-          const candidate = this.tryPlaceCrumb(
-            occupancy,
-            matrix,
-            rng,
-            crumbIndex,
-            banned,
-            pocket,
-            arrows,
-          );
-          if (!candidate) continue;
-          if (!this.tryCommit(arrows, occupancy, matrix, candidate)) continue;
-          crumbIndex++;
+    this.rebuildAllRays(arrows, occupancy, matrix);
+    let guard = 0;
+    const dice = rng ?? new SeededRandom(arrows.length * 1_000_003 + 17);
+    while (this.countLiveArrows(arrows, occupancy, matrix) > MAX_OPENING_MOVES && guard++ < 16) {
+      const before = this.countLiveArrows(arrows, occupancy, matrix);
+      const candidate = this.tryPlaceSnake(
+        occupancy,
+        matrix,
+        arrows,
+        arrows.length + 60_000 + guard,
+        Math.min(FILLER_LONG_MAX + 4, this.snakeReachCap(occupancy, 20)),
+        FILLER_RELAX_MIN,
+        dice,
+        {
+          requireBlock: true,
+          frontierOnly: false,
+          allowCheap: true,
+          allowLive: false,
+          hunt: true,
+          preferPerp: true,
+          avoidSelfHug: true,
+        },
+      );
+      if (candidate && candidate.cells.length >= FILLER_RELAX_MIN) {
+        const placed = {
+          ...candidate,
+          role: 'filler' as const,
+          blockId:
+            candidate.blockId ??
+            this.cellMacroBlockId(candidate.cells[candidate.cells.length - 1]),
+        };
+        if (
+          this.tryCommit(arrows, occupancy, matrix, placed) &&
+          this.countLiveArrows(arrows, occupancy, matrix) < before
+        ) {
           continue;
         }
-        const candidate = this.tryPlacePocketSnake(
-          occupancy,
-          matrix,
-          pocket,
-          null,
-          fillerIndex,
-          part.length,
-          Math.min(FILLER_RELAX_MIN, part.length),
-          false,
-          banned,
-          rng,
-          arrows,
-        );
-        if (!candidate) continue;
-        if (!this.tryCommit(arrows, occupancy, matrix, candidate)) continue;
-        fillerIndex++;
       }
+      break;
     }
+  }
 
-    this.growTails(arrows, occupancy, matrix, Math.max(maxTail, this.snakeReachCap(occupancy, 12)), rng);
-    this.rebuildAllRays(arrows, occupancy, matrix);
+  /** Prefer a block that still has empty floor near its origin. */
+  private pickFillerBlockId(
+    occupancy: OccupancyGrid,
+    matrix: CellValue[][],
+    rng: SeededRandom,
+  ): number | undefined {
+    if (this.macroBlocks.length === 0) return undefined;
+    const scored = this.macroBlocks.map((block) => {
+      let empty = 0;
+      const r = Math.max(4, block.radius);
+      for (let row = Math.max(0, block.row - r); row <= Math.min(occupancy.rows - 1, block.row + r); row++) {
+        for (let col = Math.max(0, block.col - r); col <= Math.min(occupancy.cols - 1, block.col + r); col++) {
+          if (matrix[row][col] !== CELL_FLOOR) continue;
+          if (occupancy.cells[row][col] !== null) continue;
+          if (Math.abs(row - block.row) + Math.abs(col - block.col) > r) continue;
+          empty++;
+        }
+      }
+      return { id: block.id, empty };
+    });
+    scored.sort((a, b) => b.empty - a.empty || a.id - b.id);
+    const nonempty = scored.filter((item) => item.empty > 0);
+    if (nonempty.length === 0) return rng.pick(this.macroBlocks).id;
+    return nonempty[0].empty === nonempty[Math.min(2, nonempty.length - 1)].empty
+      ? rng.pick(nonempty.slice(0, Math.min(3, nonempty.length))).id
+      : nonempty[0].id;
   }
 
   /**
@@ -647,15 +941,30 @@ export class SLevelGenerator {
     startFiller = 0,
     maxLen = POCKET_SNAKE_MAX,
   ): void {
+    const restoreSpoon = this.spoonStrict;
+    const restoreQuota = this.quotaActive;
+    const restoreVein = this.enforceVein;
+    // Pocket mop-up must be free to close leftover voids; spoon/quota already
+    // shaped the core + pink pack. Keeping them on here left ≥5-cell holes.
+    this.spoonStrict = false;
+    this.quotaActive = false;
+    this.enforceVein = false;
     let fillerIndex = startFiller;
     const floor = this.countFloorCells(matrix);
     const density = floor === 0 ? 1 : this.totalCells(arrows) / floor;
-    const liveRays = density >= 0.97 ? this.liveRayCells() : new Set<string>();
+    // Strip only when already very dense so early pocket pack can still
+    // swallow voids; late boards keep live corridors for the opening moves.
+    const liveRays =
+      density >= this.quality.fillTarget - 0.01 ? this.liveRayCells() : new Set<string>();
     const regions = this.emptyRegions(occupancy, matrix);
-    for (const region of regions) {
-      const parts = this.offRayGroups(region, liveRays);
+    const regionCap =
+      this.quality.packFailBudgetScale < 0.65
+        ? Math.min(regions.length, 28)
+        : regions.length;
+    for (const region of regions.slice(0, regionCap)) {
+      const parts = liveRays.size > 0 ? this.offRayGroups(region, liveRays) : [region];
       for (const part of parts) {
-        if (part.length <= CRUMB_POCKET_MAX) continue;
+        if (part.length < 2) continue;
         const added = this.fillRegionAsPuzzle(
           arrows,
           occupancy,
@@ -668,8 +977,11 @@ export class SLevelGenerator {
         fillerIndex += added;
       }
     }
-    this.growTails(arrows, occupancy, matrix, Math.max(maxTail, this.snakeReachCap(occupancy, maxLen)), rng);
+    this.growTails(arrows, occupancy, matrix, Math.max(maxTail, this.snakeReachCap(occupancy, maxLen)), rng, false);
     this.rebuildAllRays(arrows, occupancy, matrix);
+    this.spoonStrict = restoreSpoon;
+    this.quotaActive = restoreQuota;
+    this.enforceVein = restoreVein;
   }
 
   private fillRegionAsPuzzle(
@@ -693,13 +1005,15 @@ export class SLevelGenerator {
     let relaxed = false;
     const banned = new Set<string>();
     const failLimit = Math.max(
-      FILLER_QUICK_ATTEMPTS,
-      Math.min(80, Math.floor(region.length / 2)),
+      Math.floor(FILLER_QUICK_ATTEMPTS * this.quality.packFailBudgetScale),
+      Math.min(
+        Math.floor(24 * this.quality.packFailBudgetScale),
+        Math.floor(region.length / 2),
+      ),
     );
 
     while (this.emptyInPocket(occupancy, pocket) >= 2) {
       const remaining = this.emptyInPocket(occupancy, pocket);
-      if (remaining <= CRUMB_POCKET_MAX && relaxed) break;
 
       if (!relaxed && fails >= failLimit) {
         relaxed = true;
@@ -707,23 +1021,22 @@ export class SLevelGenerator {
       }
 
       const requireBlock = !relaxed && last !== null;
-      const floorLen = relaxed
-        ? FILLER_RELAX_MIN
-        : remaining >= FILLER_LONG_MIN
-          ? longMin
-          : remaining;
+      // Swallow the pocket when what's left fits one winding snake.
+      if (remaining < FILLER_RELAX_MIN) break;
+      const floorLen = relaxed ? FILLER_RELAX_MIN : Math.min(longMin, remaining);
       const candidate = this.tryPlacePocketSnake(
         occupancy,
         matrix,
         pocket,
         last,
         fillerIndex + placed,
-        relaxed ? Math.max(floorLen, 4) : snakeCap,
-        floorLen,
+        snakeCap,
+        Math.min(floorLen, remaining),
         requireBlock,
         banned,
         rng,
         arrows,
+        relaxed,
       );
       if (!candidate) {
         fails++;
@@ -732,6 +1045,18 @@ export class SLevelGenerator {
       }
 
       const head = candidate.cells[candidate.cells.length - 1];
+      const lane = this.laneLength(
+        occupancy,
+        matrix,
+        head.row,
+        head.col,
+        DIRECTION_DELTA[candidate.direction],
+      );
+      if (!relaxed && candidate.cells.length <= 4 && this.isCheapExit(lane)) {
+        banned.add(`${head.row},${head.col}:${candidate.direction}`);
+        fails++;
+        continue;
+      }
       if (!this.tryCommit(arrows, occupancy, matrix, candidate)) {
         banned.add(`${head.row},${head.col}:${candidate.direction}`);
         fails++;
@@ -759,6 +1084,7 @@ export class SLevelGenerator {
     banned: Set<string>,
     rng: SeededRandom,
     placedArrows: ArrowDefinition[],
+    allowCheap: boolean,
   ): ArrowDefinition | null {
     const empty = this.pocketCells(occupancy, pocket);
     if (empty.length < 2) return null;
@@ -782,6 +1108,7 @@ export class SLevelGenerator {
         pocket,
         last === null,
         last?.direction ?? null,
+        allowCheap,
       );
       for (const direction of dirs) {
         if (banned.has(`${head.row},${head.col}:${direction}`)) continue;
@@ -789,26 +1116,43 @@ export class SLevelGenerator {
           continue;
         }
         const delta = DIRECTION_DELTA[direction];
-        const liveNow = this.laneLength(occupancy, matrix, head.row, head.col, delta) >= 0;
-        // Pocket pieces wait for the lid; they must not be free clicks at the start.
-        if (liveNow) continue;
+        const lane = this.laneLength(occupancy, matrix, head.row, head.col, delta);
+        if (!allowCheap && this.isCheapExit(lane)) continue;
+        const liveNow = lane >= 0;
+        if (liveNow && this.countLiveArrows(placedArrows, occupancy, matrix) >= MAX_OPENING_MOVES) {
+          continue;
+        }
 
-        const snakeMax = this.rollSnakeMax(rng, maxLen, last === null, true);
-        const need = Math.min(minLen, snakeMax);
-        const grown = this.growSnake(
-          head,
-          direction,
-          occupancy,
-          matrix,
-          rng,
-          snakeMax,
-          need,
-          focusRay,
-          pocket,
-          placedArrows,
-          false,
-        );
+        const snakeMax = Math.max(minLen, this.rollSnakeMax(rng, maxLen, last === null, true));
+        const need = minLen;
+        const grown =
+          this.growSnake(
+            head,
+            direction,
+            occupancy,
+            matrix,
+            rng,
+            snakeMax,
+            need,
+            focusRay,
+            pocket,
+            placedArrows,
+            false,
+            undefined,
+            true,
+          ) ??
+          this.growSimplePocketPath(
+            head,
+            direction,
+            occupancy,
+            matrix,
+            pocket,
+            snakeMax,
+            need,
+            rng,
+          );
         if (!grown) continue;
+        if (this.violatesVeinRule(occupancy, matrix, grown)) continue;
 
         const blocks = focusRay.has(this.key(head)) || this.bodyHits(grown, focusRay, head);
         if (requireBlock && focusRay.size > 0 && !blocks) continue;
@@ -817,12 +1161,73 @@ export class SLevelGenerator {
           id: `filler-${fillerIndex}-${head.row}x${head.col}`,
           cells: grown,
           direction,
+          blockId: this.cellMacroBlockId(head),
           role: 'filler',
         };
       }
     }
 
     return null;
+  }
+
+  /**
+   * Fallback for awkward leftover voids: grow a simple ortho path inside the
+   * pocket without meander/hunt scoring (those often stall in thin corridors).
+   * Returns tail→head cells, same as growSnake.
+   */
+  private growSimplePocketPath(
+    head: GridCell,
+    direction: Direction,
+    occupancy: OccupancyGrid,
+    matrix: CellValue[][],
+    pocket: Set<string>,
+    maxLen: number,
+    minLen: number,
+    rng: SeededRandom,
+  ): GridCell[] | null {
+    const forward = DIRECTION_DELTA[direction];
+    const back: GridCell = { row: -forward.row, col: -forward.col };
+    const neck = { row: head.row + back.row, col: head.col + back.col };
+    const neckKey = this.key(neck);
+    if (!pocket.has(neckKey)) return null;
+    if (!this.isInside(occupancy, neck.row, neck.col)) return null;
+    if (matrix[neck.row][neck.col] !== CELL_FLOOR) return null;
+    if (occupancy.cells[neck.row][neck.col] !== null) return null;
+
+    const path: GridCell[] = [{ ...head }, { ...neck }];
+    const used = new Set<string>([this.key(head), neckKey]);
+    let cur = neck;
+    let heading = back;
+
+    while (path.length < maxLen) {
+      const options: GridCell[] = [];
+      for (const step of [
+        heading,
+        { row: -heading.col, col: heading.row },
+        { row: heading.col, col: -heading.row },
+      ]) {
+        const next = { row: cur.row + step.row, col: cur.col + step.col };
+        const key = this.key(next);
+        if (!pocket.has(key) || used.has(key)) continue;
+        if (!this.isInside(occupancy, next.row, next.col)) continue;
+        if (matrix[next.row][next.col] !== CELL_FLOOR) continue;
+        if (occupancy.cells[next.row][next.col] !== null) continue;
+        if (this.stepWouldSelfHug(path, next)) continue;
+        options.push(next);
+      }
+      if (options.length === 0) break;
+      const pick =
+        options.find(
+          (cell) => cell.row === cur.row + heading.row && cell.col === cur.col + heading.col,
+        ) ?? rng.pick(options);
+      heading = { row: pick.row - cur.row, col: pick.col - cur.col };
+      path.push(pick);
+      used.add(this.key(pick));
+      cur = pick;
+    }
+
+    if (path.length < minLen) return null;
+    return path.map((cell) => ({ ...cell })).reverse();
   }
 
   private orderPocketHeads(
@@ -853,10 +1258,12 @@ export class SLevelGenerator {
     pocket: Set<string>,
     first: boolean,
     lastDir: Direction | null,
+    allowCheap: boolean,
   ): Direction[] {
     const scored = ALL_DIRECTIONS.map((direction) => {
       const inner = this.pocketLane(head, direction, occupancy, pocket);
       const toLid = this.stepsToOccupant(head, direction, occupancy, matrix);
+      const lane = this.laneLength(occupancy, matrix, head.row, head.col, DIRECTION_DELTA[direction]);
       let score = 0;
       if (first) {
         score = (toLid === 1 ? 80 : 0) + inner - (toLid > 8 ? 30 : 0);
@@ -867,6 +1274,10 @@ export class SLevelGenerator {
         if (this.axisOf(direction) === this.axisOf(lastDir)) score -= 25;
         else score += 20;
       }
+      if (this.quotaActive && this.directionQuotaBanned(this.zoneIndex(head, occupancy), direction)) {
+        score -= 120;
+      }
+      if (!allowCheap && this.isCheapExit(lane)) score -= 90;
       return { direction, score };
     });
     scored.sort((a, b) => b.score - a.score || a.direction.localeCompare(b.direction));
@@ -1034,6 +1445,74 @@ export class SLevelGenerator {
     return regions;
   }
 
+  /**
+   * True when any empty floor patch is too small to host a winding snake
+   * (1 … minViable−1 cells). Used by the vein rule after a trial placement.
+   */
+  private hasMicroEmptyRegions(
+    occupancy: OccupancyGrid,
+    matrix: CellValue[][],
+    minViable: number,
+  ): boolean {
+    const seen: boolean[][] = Array.from({ length: occupancy.rows }, () =>
+      Array<boolean>(occupancy.cols).fill(false),
+    );
+
+    for (let row = 0; row < occupancy.rows; row++) {
+      for (let col = 0; col < occupancy.cols; col++) {
+        if (seen[row][col]) continue;
+        if (matrix[row][col] !== CELL_FLOOR) continue;
+        if (occupancy.cells[row][col] !== null) continue;
+
+        let size = 0;
+        const stack: GridCell[] = [{ row, col }];
+        seen[row][col] = true;
+
+        while (stack.length > 0) {
+          const cell = stack.pop()!;
+          size++;
+          for (const step of [
+            { row: 1, col: 0 },
+            { row: -1, col: 0 },
+            { row: 0, col: 1 },
+            { row: 0, col: -1 },
+          ]) {
+            const nr = cell.row + step.row;
+            const nc = cell.col + step.col;
+            if (!this.isInside(occupancy, nr, nc) || seen[nr][nc]) continue;
+            if (matrix[nr][nc] !== CELL_FLOOR) continue;
+            if (occupancy.cells[nr][nc] !== null) continue;
+            seen[nr][nc] = true;
+            stack.push({ row: nr, col: nc });
+          }
+        }
+
+        if (size > 0 && size < minViable) return true;
+      }
+    }
+
+    return false;
+  }
+
+  /**
+   * Trial-commit cells, reject if they carve pockets too small for a winding
+   * snake (1 … FILLER_RELAX_MIN−1). Leftovers of FILLER_RELAX_MIN+ stay fillable.
+   * Only enforced once the board is dense.
+   */
+  private violatesVeinRule(
+    occupancy: OccupancyGrid,
+    matrix: CellValue[][],
+    cells: GridCell[],
+  ): boolean {
+    if (!this.enforceVein) return false;
+    if (this.occupancyDensity(occupancy, matrix) < ENDGAME_DENSITY) return false;
+    const probe = '__vein__';
+    for (const cell of cells) occupancy.cells[cell.row][cell.col] = probe;
+    const bad = this.hasMicroEmptyRegions(occupancy, matrix, FILLER_RELAX_MIN);
+    this.uncommitCells(occupancy, cells);
+    return bad;
+  }
+
   private uncommitCells(occupancy: OccupancyGrid, cells: GridCell[]): void {
     for (const cell of cells) occupancy.cells[cell.row][cell.col] = null;
   }
@@ -1056,12 +1535,19 @@ export class SLevelGenerator {
     occupancy: OccupancyGrid,
     matrix: CellValue[][],
     arrow: ArrowDefinition,
+    requireSolvable = true,
   ): boolean {
+    if (arrow.role === undefined && this.activeBlockId !== null) {
+      arrow.blockId = this.activeBlockId;
+    } else if (arrow.blockId === undefined) {
+      const head = arrow.cells[arrow.cells.length - 1];
+      arrow.blockId = this.cellMacroBlockId(head);
+    }
     if (this.blocksAndWaitsForSame(arrow, occupancy, matrix)) return false;
     this.commitArrow(occupancy, arrow);
     arrows.push(arrow);
     this.noteOccupied(arrows, occupancy, matrix, arrow);
-    if (!this.removalOrder(arrows, occupancy, matrix)) {
+    if (requireSolvable && !this.removalOrder(arrows, occupancy, matrix)) {
       arrows.pop();
       this.uncommitCells(occupancy, arrow.cells);
       this.rebuildAllRays(arrows, occupancy, matrix);
@@ -1222,81 +1708,6 @@ export class SLevelGenerator {
     return cells;
   }
 
-  /**
-   * Two-cell arrow for a dead-end pocket smaller than 3 cells. May wait for
-   * neighbours to leave; does not require a live ray at placement time.
-   */
-  private tryPlaceCrumb(
-    occupancy: OccupancyGrid,
-    matrix: CellValue[][],
-    rng: SeededRandom,
-    crumbIndex: number,
-    banned: Set<string>,
-    pocket?: Set<string>,
-    placedArrows: ArrowDefinition[] = [],
-  ): ArrowDefinition | null {
-    const empty: GridCell[] = [];
-    for (let row = 0; row < occupancy.rows; row++) {
-      for (let col = 0; col < occupancy.cols; col++) {
-        if (matrix[row][col] !== CELL_FLOOR) continue;
-        if (occupancy.cells[row][col] !== null) continue;
-        if (pocket && !pocket.has(this.key({ row, col }))) continue;
-        empty.push({ row, col });
-      }
-    }
-    if (empty.length < 2 || empty.length > CRUMB_POCKET_MAX) return null;
-
-    const frontier = empty.filter((cell) => this.touchesOccupied(occupancy, cell));
-    const rest = empty.filter((cell) => !this.touchesOccupied(occupancy, cell));
-    const ordered = [...rng.shuffle(frontier), ...rng.shuffle(rest)];
-
-    for (const head of ordered) {
-      if (occupancy.cells[head.row][head.col] !== null) continue;
-      const directions = this.orderCrumbDirections(occupancy, matrix, head, rng);
-      
-      for (const direction of directions) {
-        if (banned.has(`${head.row},${head.col}:${direction}`)) continue;
-
-        if (!this.escapesOnceOccupantsLeave(occupancy, matrix, head, direction)) {
-          continue;
-        }
-        const liveNow =
-          this.laneLength(
-            occupancy,
-            matrix,
-            head.row,
-            head.col,
-            DIRECTION_DELTA[direction],
-          ) >= 0;
-        if (liveNow && this.countLiveArrows(placedArrows, occupancy, matrix) >= MAX_OPENING_MOVES) {
-          continue;
-        }
-        const grown = this.growSnake(
-          head,
-          direction,
-          occupancy,
-          matrix,
-          rng,
-          GAP_FILL_MAX_LENGTH,
-          2,
-          new Set(),
-          pocket ?? null,
-          placedArrows,
-          false,
-        );
-        if (!grown) continue;
-        return {
-          id: `crumb-${crumbIndex}-${head.row}x${head.col}`,
-          cells: grown,
-          direction,
-          role: 'crumb',
-        };
-      }
-    }
-
-    return null;
-  }
-
   private tryPlaceSnake(
     occupancy: OccupancyGrid,
     matrix: CellValue[][],
@@ -1305,7 +1716,18 @@ export class SLevelGenerator {
     maxLen: number,
     minLen: number,
     rng: SeededRandom,
-    opts: { requireBlock: boolean; frontierOnly: boolean; allowCheap?: boolean; allowLive?: boolean; hunt?: boolean; preferPerp?: boolean },
+    opts: {
+      requireBlock: boolean;
+      frontierOnly: boolean;
+      allowCheap?: boolean;
+      allowLive?: boolean;
+      hunt?: boolean;
+      preferPerp?: boolean;
+      blockId?: number;
+      bridgeRay?: Set<string>;
+      /** Pink / mop-up: never hug own body (fake self-blocks). */
+      avoidSelfHug?: boolean;
+    },
   ): ArrowDefinition | null {
     const growMax = this.snakeReachCap(occupancy, maxLen);
     const liveCount = this.countLiveArrows(placed, occupancy, matrix);
@@ -1325,7 +1747,7 @@ export class SLevelGenerator {
       );
     }
 
-    if (placed.length > 0 && liveCount < MAX_OPENING_MOVES && rng.next() < 0.7) {
+    if (!opts.blockId && !opts.bridgeRay && placed.length > 0 && liveCount < MAX_OPENING_MOVES && rng.next() < 0.7) {
       const branch = this.searchPlacement(
         occupancy,
         matrix,
@@ -1458,7 +1880,17 @@ export class SLevelGenerator {
     maxLen: number,
     minLen: number,
     rng: SeededRandom,
-    opts: { requireBlock: boolean; frontierOnly: boolean; allowCheap?: boolean; allowLive?: boolean; hunt?: boolean; preferPerp?: boolean },
+    opts: {
+      requireBlock: boolean;
+      frontierOnly: boolean;
+      allowCheap?: boolean;
+      allowLive?: boolean;
+      hunt?: boolean;
+      preferPerp?: boolean;
+      blockId?: number;
+      bridgeRay?: Set<string>;
+      avoidSelfHug?: boolean;
+    },
     rayCells: Set<string>,
     mustBlock: boolean,
     rayMode?: 'oldest' | 'random',
@@ -1475,17 +1907,21 @@ export class SLevelGenerator {
     }[] = [];
 
     for (const direction of rng.shuffle(ALL_DIRECTIONS)) {
+      const bridgeFocus = opts.bridgeRay && opts.bridgeRay.size > 0 ? opts.bridgeRay : null;
       const focus =
-        rayMode !== undefined
-          ? this.pickFocusRay(
-              placed,
-              occupancy,
-              matrix,
-              rng,
-              rayMode,
-              opts.preferPerp === false ? undefined : direction,
-            )
-          : rayCells;
+        bridgeFocus ??
+        (opts.blockId !== undefined
+          ? this.pickNearHomeRay(placed, occupancy, matrix, rng, opts.blockId)
+          : rayMode !== undefined
+            ? this.pickFocusRay(
+                placed,
+                occupancy,
+                matrix,
+                rng,
+                rayMode,
+                opts.preferPerp === false ? undefined : direction,
+              )
+            : rayCells);
       const blockThis = mustBlock && focus.size > 0;
       const huntFar = opts.hunt !== false && focus.size > 0 && (blockThis || rayMode !== undefined);
       const onRay =
@@ -1500,7 +1936,7 @@ export class SLevelGenerator {
             )
           : [];
       const hunters = huntFar
-        ? this.sampleHuntHeads(occupancy, matrix, direction, focus, rng, maxLen)
+        ? this.sampleHuntHeads(occupancy, matrix, direction, focus, rng, maxLen, opts.blockId)
         : blockThis && focus.size > 0
           ? []
           : this.findHeadCandidates(
@@ -1513,8 +1949,8 @@ export class SLevelGenerator {
             );
       const heads = huntFar
         ? [
-            ...this.orderHeads(hunters, rng, placed, occupancy, focus, maxLen).slice(0, 12),
-            ...this.orderHeads(onRay, rng, placed, occupancy, focus, maxLen).slice(0, 16),
+            ...this.orderHeads(hunters, rng, placed, occupancy, focus, maxLen, opts.blockId).slice(0, 12),
+            ...this.orderHeads(onRay, rng, placed, occupancy, focus, maxLen, opts.blockId).slice(0, 16),
           ]
         : this.orderHeads(
             rng.shuffle([...hunters, ...onRay]),
@@ -1523,16 +1959,35 @@ export class SLevelGenerator {
             occupancy,
             focus,
             maxLen,
+            opts.blockId,
           ).slice(0, 32);
       if (heads.length === 0) continue;
       const legal = this.filterHeadsByZone(heads, occupancy);
+      const blockLegal =
+        opts.blockId === undefined
+          ? legal
+          : legal.filter((head) => this.headBelongsToBlock(head.cell, opts.blockId));
       const quotaLegal = this.filterHeadsByQuota(legal, occupancy, direction);
       const banned = heads.filter((head) => this.zoneIsBanned(head.cell, occupancy));
+      const blockBanned =
+        opts.blockId === undefined
+          ? banned
+          : banned.filter((head) => this.headBelongsToBlock(head.cell, opts.blockId));
       const quotaBanned = this.filterHeadsByQuota(banned, occupancy, direction);
       batches.push({
         direction,
-        legal: quotaLegal.length > 0 ? quotaLegal : legal,
-        banned: quotaBanned.length > 0 ? quotaBanned : banned,
+        legal:
+          quotaLegal.length > 0
+            ? blockLegal.filter((head) => quotaLegal.includes(head))
+            : this.quotaActive
+              ? quotaLegal
+              : blockLegal,
+        banned:
+          quotaBanned.length > 0
+            ? blockBanned.filter((head) => quotaBanned.includes(head))
+            : this.quotaActive
+              ? quotaBanned
+              : blockBanned,
         focus,
         block: blockThis,
       });
@@ -1553,7 +2008,8 @@ export class SLevelGenerator {
             candidate.cell.row,
             candidate.cell.col,
             delta,
-          ) === 0
+          ) === 0 &&
+          !opts.allowCheap
         ) {
           continue;
         }
@@ -1585,8 +2041,11 @@ export class SLevelGenerator {
           null,
           placed,
           opts.hunt !== false,
+          opts.blockId,
+          opts.avoidSelfHug === true,
         );
         if (!cells) continue;
+        if (this.violatesVeinRule(occupancy, matrix, cells)) continue;
 
         const blocks =
           candidate.blocks || this.bodyHits(cells, focus, candidate.cell);
@@ -1600,6 +2059,7 @@ export class SLevelGenerator {
           id: `s${arrowIndex}-${candidate.cell.row}x${candidate.cell.col}`,
           cells,
           direction,
+          blockId: opts.blockId,
         };
       }
       return null;
@@ -1655,6 +2115,8 @@ export class SLevelGenerator {
     allowed: Set<string> | null = null,
     placed: ArrowDefinition[] = [],
     enableHunt = true,
+    homeBlockId?: number,
+    avoidSelfHug = false,
   ): GridCell[] | null {
     const forward = DIRECTION_DELTA[direction];
     const back: GridCell = { row: -forward.row, col: -forward.col };
@@ -1677,6 +2139,7 @@ export class SLevelGenerator {
     const hunt = enableHunt
       ? this.buildRayHunt(placed, rayCells, occupancy)
       : this.idleHunt(occupancy);
+    const boardDensity = this.occupancyDensity(occupancy, matrix);
     const grown = this.growMeander(
       start,
       back,
@@ -1689,6 +2152,9 @@ export class SLevelGenerator {
       rng,
       allowed,
       placed,
+      homeBlockId,
+      boardDensity,
+      avoidSelfHug,
     );
 
     if (grown.length < minLen) return null;
@@ -1721,6 +2187,7 @@ export class SLevelGenerator {
       primaryCells: this.cellsFromKeys(focus),
       bonus,
       focusAxis: this.rayAxis(focus),
+      bridge: this.bridgeHuntActive,
       centerRow0: rows * 0.25,
       centerRow1: rows * 0.75,
       centerCol0: cols * 0.25,
@@ -1736,6 +2203,7 @@ export class SLevelGenerator {
       primaryCells: [],
       bonus: new Set(),
       focusAxis: null,
+      bridge: false,
       centerRow0: rows * 0.25,
       centerRow1: rows * 0.75,
       centerCol0: cols * 0.25,
@@ -1764,6 +2232,9 @@ export class SLevelGenerator {
     rng: SeededRandom,
     allowed: Set<string> | null,
     placed: ArrowDefinition[],
+    homeBlockId: number | undefined,
+    boardDensity: number,
+    avoidSelfHug = false,
   ): GridCell[] {
     const grown: GridCell[] = [...start];
     let heading = back;
@@ -1796,7 +2267,25 @@ export class SLevelGenerator {
         inbound,
         allowed,
         byId,
+        homeBlockId,
+        boardDensity,
+        avoidSelfHug,
       );
+      if (homeBlockId !== undefined) {
+        const allowCross = !this.lastBlockCrossedBorder || hunt.bridge;
+        const slack = allowCross
+          ? hunt.bridge && !hitPrimary
+            ? FOREIGN_OVERLAP + 6
+            : FOREIGN_OVERLAP + 2
+          : 0;
+        const homeOpts = options.filter((option) =>
+          allowCross
+            ? this.bodyStaysInBlock(option.cell, homeBlockId, slack)
+            : this.cellMacroBlockId(option.cell) === homeBlockId ||
+              this.headBelongsToBlock(option.cell, homeBlockId, HEAD_RADIUS_SLACK),
+        );
+        if (homeOpts.length > 0) options = homeOpts;
+      }
       if (!hitPrimary) {
         const straight = options.filter((option) => !option.turned);
         const turns = options.filter((option) => option.turned);
@@ -1869,16 +2358,19 @@ export class SLevelGenerator {
     inbound: GridCell | null,
     allowed: Set<string> | null = null,
     byId: Map<string, ArrowDefinition> = new Map(),
+    homeBlockId?: number,
+    boardDensity = 0,
+    avoidSelfHug = false,
   ): Array<{ cell: GridCell; turned: boolean; score: number }> {
+    const endGameAmp = boardDensity > ENDGAME_DENSITY ? ENDGAME_MAGNET_AMP : 1;
     const leftH = { row: -heading.col, col: heading.row };
     const rightH = { row: heading.col, col: -heading.row };
     const raw: Array<{ cell: GridCell; turned: boolean; step: GridCell }> = [];
 
     const consider = (step: GridCell, turned: boolean): void => {
       const cell = { row: prev.row + step.row, col: prev.col + step.col };
-      if (this.canOccupy(occupancy, matrix, cell, path, head, direction, allowed)) {
-        raw.push({ cell, turned, step });
-      }
+      if (!this.canOccupy(occupancy, matrix, cell, path, head, direction, allowed)) return;
+      raw.push({ cell, turned, step });
     };
 
     consider(heading, false);
@@ -1901,7 +2393,9 @@ export class SLevelGenerator {
       const key = this.key(option.cell);
       const nextDist = this.nearestManhattanCells(option.cell, magnetCells);
       if (Number.isFinite(prevDist) && Number.isFinite(nextDist)) {
-        const pull = hitPrimary ? MAGNET_AFTER_PRIMARY : MAGNET_PER_CELL;
+        const pull = hitPrimary
+          ? MAGNET_AFTER_PRIMARY
+          : MAGNET_PER_CELL * endGameAmp + (hunt.bridge ? BRIDGE_PULL : 0);
         score += pull * (prevDist - nextDist);
       }
       if (!hitPrimary && Number.isFinite(prevBonus)) {
@@ -1915,11 +2409,22 @@ export class SLevelGenerator {
       const onBonus = remainingBonus.has(key);
       if (onPrimary && !hitPrimary) {
         const stepAxis: 'h' | 'v' = option.step.row === 0 ? 'h' : 'v';
-        score += PRIMARY_CROSS;
+        score += PRIMARY_CROSS + (hunt.bridge ? BRIDGE_PULL : 0);
         if (hunt.focusAxis && stepAxis !== hunt.focusAxis) score += 45;
         else if (hunt.focusAxis && stepAxis === hunt.focusAxis) score -= 70;
       }
-      if (onBonus) score += MULTI_RAY_CROSS;
+      if (onBonus) score += MULTI_RAY_CROSS * endGameAmp;
+
+      if (homeBlockId !== undefined) {
+        const home = this.macroBlocks.find((block) => block.id === homeBlockId);
+        if (home) {
+          const prevHome = Math.abs(prev.row - home.row) + Math.abs(prev.col - home.col);
+          const nextHome = Math.abs(option.cell.row - home.row) + Math.abs(option.cell.col - home.col);
+          if (this.cellMacroBlockId(option.cell) === homeBlockId) score += HOME_STAY;
+          else score -= FOREIGN_STEP_PENALTY;
+          if (hunt.bridge && nextHome < prevHome) score += 20;
+        }
+      }
 
       if (
         option.cell.row >= hunt.centerRow0 &&
@@ -1931,7 +2436,13 @@ export class SLevelGenerator {
       }
 
       const coil = this.coilScore(occupancy, path, prev, option.cell);
-      score += hitPrimary ? coil : Math.round(coil * 0.15);
+      // Pink fillers must not coil against themselves (fake self-blocks).
+      if (avoidSelfHug) {
+        if (this.stepWouldSelfHug(path, option.cell)) score -= SELF_HUG_PENALTY;
+        if (this.closesTwoByTwo(path, option.cell)) score -= 180;
+      } else {
+        score += hitPrimary ? coil : Math.round(coil * 0.15);
+      }
       const run = this.trailingRun(path, option.step) + 1;
       if (run >= 9) score -= 250;
       if (option.turned) {
@@ -2023,24 +2534,39 @@ export class SLevelGenerator {
     rayCells: Set<string>,
     rng: SeededRandom,
     maxLen: number,
+    blockId?: number,
   ): HeadCandidate[] {
     const rayPts = this.cellsFromKeys(rayCells);
     if (rayPts.length === 0) return [];
     const delta = DIRECTION_DELTA[direction];
     const found: HeadCandidate[] = [];
     const seen = new Set<string>();
-    const maxGap = Math.max(HUNT_MIN_GAP + 1, maxLen - HUNT_BRANCH_RESERVE);
+    const home = blockId === undefined ? null : this.macroBlocks.find((block) => block.id === blockId) ?? null;
+    const radius = home
+      ? Math.max(home.radius, 6)
+      : Math.max(4, Math.floor(Math.max(occupancy.rows, occupancy.cols) * 0.28));
+    const minGap = home ? 2 : HUNT_MIN_GAP;
+    const maxGap = home
+      ? Math.max(minGap + 1, home.radius + 8)
+      : Math.max(HUNT_MIN_GAP + 1, maxLen - HUNT_BRANCH_RESERVE);
     for (let attempt = 0; attempt < 96 && found.length < 16; attempt++) {
-      const sampled =
-        attempt < 100 ? this.randomCellInUnbannedZone(rng, occupancy) : null;
-      const row = sampled ? sampled.row : rng.nextInt(0, occupancy.rows - 1);
-      const col = sampled ? sampled.col : rng.nextInt(0, occupancy.cols - 1);
+      let row: number;
+      let col: number;
+      if (home && attempt < 80) {
+        const span = radius + (attempt > 40 ? 4 : 0);
+        row = Math.min(occupancy.rows - 1, Math.max(0, home.row + rng.nextInt(-span, span)));
+        col = Math.min(occupancy.cols - 1, Math.max(0, home.col + rng.nextInt(-span, span)));
+      } else {
+        const sampled = attempt < 100 ? this.randomCellInUnbannedZone(rng, occupancy) : null;
+        row = sampled ? sampled.row : rng.nextInt(0, occupancy.rows - 1);
+        col = sampled ? sampled.col : rng.nextInt(0, occupancy.cols - 1);
+      }
       const key = `${row},${col}`;
       if (seen.has(key) || rayCells.has(key)) continue;
       seen.add(key);
       if (matrix[row]?.[col] !== CELL_FLOOR || occupancy.cells[row][col] !== null) continue;
       const gap = this.nearestManhattanCells({ row, col }, rayPts);
-      if (gap < HUNT_MIN_GAP || gap > maxGap) continue;
+      if (gap < minGap || gap > maxGap) continue;
       const cell = { row, col };
       if (this.zoneIsBanned(cell, occupancy) && attempt < 100) continue;
       const lane = this.laneLength(occupancy, matrix, row, col, delta);
@@ -2091,8 +2617,17 @@ export class SLevelGenerator {
     occupancy: OccupancyGrid,
     rayCells: Set<string> = new Set(),
     maxLen = DEFAULT_MAX_ARROW_LENGTH,
+    homeBlockId?: number,
   ): HeadCandidate[] {
-    return this.orderHeadsUnfiltered(rng.shuffle(candidates), rng, placed, occupancy, rayCells, maxLen);
+    return this.orderHeadsUnfiltered(
+      rng.shuffle(candidates),
+      rng,
+      placed,
+      occupancy,
+      rayCells,
+      maxLen,
+      homeBlockId,
+    );
   }
 
   private orderHeadsUnfiltered(
@@ -2102,7 +2637,21 @@ export class SLevelGenerator {
     occupancy: OccupancyGrid,
     rayCells: Set<string>,
     maxLen: number,
+    homeBlockId?: number,
   ): HeadCandidate[] {
+    const home = homeBlockId === undefined ? null : this.macroBlocks.find((block) => block.id === homeBlockId) ?? null;
+    if (home) {
+      const near = shuffled.filter((candidate) => this.headBelongsToBlock(candidate.cell, home.id));
+      const pool = near.length > 0 ? near : shuffled.filter((candidate) =>
+        this.headBelongsToBlock(candidate.cell, home.id, HEAD_RADIUS_SLACK + 4),
+      );
+      const ordered = (pool.length > 0 ? pool : shuffled).sort((a, b) => {
+        const da = Math.abs(a.cell.row - home.row) + Math.abs(a.cell.col - home.col);
+        const db = Math.abs(b.cell.row - home.row) + Math.abs(b.cell.col - home.col);
+        return da - db;
+      });
+      return ordered;
+    }
     if (placed.length === 0) {
       const long = [...shuffled].sort((a, b) => b.lane - a.lane);
       const pool = long.slice(0, Math.max(4, Math.ceil(long.length * 0.35)));
@@ -2299,29 +2848,6 @@ export class SLevelGenerator {
   }
 
   /** Prefer a real slide over an instant hop off the rim. */
-  private orderCrumbDirections(
-    occupancy: OccupancyGrid,
-    matrix: CellValue[][],
-    head: GridCell,
-    rng: SeededRandom,
-  ): Direction[] {
-    const shuffled = rng.shuffle(ALL_DIRECTIONS);
-    const deep: Direction[] = [];
-    const cheap: Direction[] = [];
-    for (const direction of shuffled) {
-      const lane = this.laneLength(
-        occupancy,
-        matrix,
-        head.row,
-        head.col,
-        DIRECTION_DELTA[direction],
-      );
-      if (this.isCheapExit(lane)) cheap.push(direction);
-      else deep.push(direction);
-    }
-    return [...deep, ...cheap];
-  }
-
   private isCheapExit(lane: number): boolean {
     return lane >= 0 && lane <= CHEAP_EXIT_LANE;
   }
@@ -2402,11 +2928,12 @@ export class SLevelGenerator {
     matrix: CellValue[][],
     maxLength: number,
     _rng?: SeededRandom,
+    respectBlocks = true,
   ): void {
     if (arrows.length === 0) return;
     const snapshot = arrows.map((arrow) => arrow.cells.map((cell) => ({ ...cell })));
     const before = this.totalCells(arrows);
-    this.fillPass(arrows, occupancy, matrix, maxLength);
+    this.fillPass(arrows, occupancy, matrix, maxLength, respectBlocks);
     if (this.totalCells(arrows) === before) return;
     if (this.removalOrder(arrows, occupancy, matrix)) {
       this.rebuildAllRays(arrows, occupancy, matrix);
@@ -2425,6 +2952,7 @@ export class SLevelGenerator {
     occupancy: OccupancyGrid,
     matrix: CellValue[][],
     maxLength: number,
+    respectBlocks = true,
   ): void {
     const lastRayOwner = this.buildRayOwnership(arrows, occupancy, matrix);
     const byId = new Map(arrows.map((arrow) => [arrow.id, arrow]));
@@ -2443,6 +2971,7 @@ export class SLevelGenerator {
             byId,
             lastRayOwner[row][col],
             maxLength,
+            respectBlocks,
           );
           if (claimant === null) continue;
           claimant.cells.unshift({ row, col });
@@ -2461,14 +2990,34 @@ export class SLevelGenerator {
     byId: Map<string, ArrowDefinition>,
     lastRayOwner: number,
     maxLength: number,
+    respectBlocks = true,
   ): ArrowDefinition | null {
     for (let index = arrows.length - 1; index > lastRayOwner; index--) {
       const arrow = arrows[index];
-      if (arrow.cells.length >= maxLength) continue;
+      const filler = arrow.role === 'filler' || arrow.role === 'crumb';
+      const cap = filler ? Math.min(maxLength, FILLER_TAIL_CAP) : maxLength;
+      if (arrow.cells.length >= cap) continue;
       const head = arrow.cells[arrow.cells.length - 1];
       if (this.isOnEscapeRay({ row, col }, head, arrow.direction)) continue;
       const tail = arrow.cells[0];
       if (Math.abs(tail.row - row) + Math.abs(tail.col - col) !== 1) continue;
+      if (filler && this.stepWouldSelfHug(arrow.cells, { row, col })) continue;
+      if (respectBlocks) {
+        const cellBlock = this.cellMacroBlockId({ row, col });
+        if (
+          arrow.blockId !== undefined &&
+          cellBlock !== undefined &&
+          arrow.blockId !== cellBlock
+        ) {
+          const home = this.macroBlocks.find((block) => block.id === arrow.blockId);
+          const other = this.macroBlocks.find((block) => block.id === cellBlock);
+          if (home && other) {
+            const homeDist = Math.abs(row - home.row) + Math.abs(col - home.col);
+            const otherDist = Math.abs(row - other.row) + Math.abs(col - other.col);
+            if (otherDist + FOREIGN_OVERLAP + 3 < homeDist) continue;
+          }
+        }
+      }
       if (this.tailWouldStripe(arrow, { row, col })) continue;
       if (this.spoonStrict && this.isSameDirectionSpoon(occupancy, byId, { row, col }, arrow.direction)) {
         continue;
@@ -2786,12 +3335,65 @@ export class SLevelGenerator {
     return false;
   }
 
+  /**
+   * True when `cell` would sit orthogonally against a non-consecutive cell of
+   * `path` (U-hooks, spirals, fake self-blocks). The immediate predecessor is OK.
+   */
+  private stepWouldSelfHug(path: GridCell[], cell: GridCell): boolean {
+    if (path.length === 0) return false;
+    const prev = path[path.length - 1];
+    for (const step of [
+      { row: 1, col: 0 },
+      { row: -1, col: 0 },
+      { row: 0, col: 1 },
+      { row: 0, col: -1 },
+    ]) {
+      const nr = cell.row + step.row;
+      const nc = cell.col + step.col;
+      if (prev.row === nr && prev.col === nc) continue;
+      if (path.some((p) => p.row === nr && p.col === nc)) return true;
+    }
+    return false;
+  }
+
+  /** True when any non-consecutive cells of the polyline are orthogonally adjacent. */
+  private pathSelfHugs(cells: GridCell[]): boolean {
+    const index = new Map<string, number>();
+    for (let i = 0; i < cells.length; i++) index.set(this.key(cells[i]), i);
+    for (let i = 0; i < cells.length; i++) {
+      const cell = cells[i];
+      for (const step of [
+        { row: 1, col: 0 },
+        { row: -1, col: 0 },
+        { row: 0, col: 1 },
+        { row: 0, col: -1 },
+      ]) {
+        const j = index.get(this.key({ row: cell.row + step.row, col: cell.col + step.col }));
+        if (j === undefined) continue;
+        if (Math.abs(i - j) > 1) return true;
+      }
+    }
+    return false;
+  }
+
   private countFloorCells(matrix: CellValue[][]): number {
     let count = 0;
     for (const row of matrix) {
       for (const cell of row) if (cell === CELL_FLOOR) count++;
     }
     return count;
+  }
+
+  private occupancyDensity(occupancy: OccupancyGrid, matrix: CellValue[][]): number {
+    const floor = this.countFloorCells(matrix);
+    if (floor === 0) return 1;
+    let occupied = 0;
+    for (let row = 0; row < occupancy.rows; row++) {
+      for (let col = 0; col < occupancy.cols; col++) {
+        if (matrix[row][col] === CELL_FLOOR && occupancy.cells[row][col] !== null) occupied++;
+      }
+    }
+    return occupied / floor;
   }
 
   private resolveInteriorSize(sLevelIndex: number, override?: number): number {
@@ -2920,12 +3522,306 @@ export class SLevelGenerator {
     return { row: rng.nextInt(row0, row1), col: rng.nextInt(col0, col1) };
   }
 
+  private setupMacroBlocks(occupancy: OccupancyGrid, matrix: CellValue[][], rng: SeededRandom): void {
+    const floor = this.countFloorCells(matrix);
+    if (floor <= 0) {
+      this.macroBlocks = [];
+      this.macroRobinIndex = 0;
+      this.activeBlockId = null;
+      this.lastVisitedBlockId = null;
+      this.lastCommittedBlockId = null;
+      this.clusterBudget = 0;
+      this.clusterPlaced = 0;
+      this.pendingBridgeRay = null;
+      this.bridgeHuntActive = false;
+      return;
+    }
+    const span = Math.max(occupancy.rows, occupancy.cols);
+    this.macroRadiusCap = Math.max(10, Math.floor(span * 0.34));
+    const target = rng.nextInt(2, 7);
+    const blocks: MacroBlock[] = [];
+    const minGap = Math.max(6, Math.floor(span * 0.22));
+    const startRadius = Math.max(6, Math.floor(minGap * 0.5));
+    let guard = 0;
+    while (blocks.length < target && guard < 800) {
+      guard++;
+      const row = rng.nextInt(0, occupancy.rows - 1);
+      const col = rng.nextInt(0, occupancy.cols - 1);
+      if (matrix[row][col] !== CELL_FLOOR) continue;
+      if (blocks.some((block) => Math.abs(block.row - row) + Math.abs(block.col - col) < minGap)) {
+        continue;
+      }
+      blocks.push({ id: blocks.length, row, col, radius: startRadius });
+    }
+    if (blocks.length < 2) {
+      const fallback = this.floorCells(matrix);
+      for (const cell of fallback) {
+        if (blocks.length >= 2) break;
+        if (blocks.some((block) => Math.abs(block.row - cell.row) + Math.abs(block.col - cell.col) < minGap)) {
+          continue;
+        }
+        blocks.push({ id: blocks.length, row: cell.row, col: cell.col, radius: startRadius });
+      }
+    }
+    this.macroBlocks = rng.shuffle(blocks).map((block, index) => ({ ...block, id: index }));
+    this.macroRobinIndex = 0;
+    this.activeBlockId = this.macroBlocks[0]?.id ?? null;
+    this.lastVisitedBlockId = null;
+    this.lastCommittedBlockId = null;
+    this.clusterBudget = this.macroBlocks.length > 0 ? rng.nextInt(1, 5) : 0;
+    this.clusterPlaced = 0;
+    this.pendingBridgeRay = null;
+    this.bridgeHuntActive = false;
+  }
+
+  private floorCells(matrix: CellValue[][]): GridCell[] {
+    const cells: GridCell[] = [];
+    for (let row = 0; row < matrix.length; row++) {
+      for (let col = 0; col < matrix[row].length; col++) {
+        if (matrix[row][col] === CELL_FLOOR) cells.push({ row, col });
+      }
+    }
+    return cells;
+  }
+
+  private cellMacroBlockId(cell: GridCell): number | undefined {
+    if (this.macroBlocks.length === 0) return undefined;
+    let best = this.macroBlocks[0];
+    let bestDist = Number.POSITIVE_INFINITY;
+    for (const block of this.macroBlocks) {
+      const dist = Math.abs(block.row - cell.row) + Math.abs(block.col - cell.col);
+      if (dist < bestDist) {
+        bestDist = dist;
+        best = block;
+      }
+    }
+    return best.id;
+  }
+
+  private headBelongsToBlock(cell: GridCell, blockId: number | undefined, extra = HEAD_RADIUS_SLACK): boolean {
+    if (blockId === undefined) return true;
+    const home = this.macroBlocks.find((block) => block.id === blockId);
+    if (!home) return true;
+    return Math.abs(cell.row - home.row) + Math.abs(cell.col - home.col) <= home.radius + extra;
+  }
+
+  private bodyStaysInBlock(cell: GridCell, homeBlockId: number, slack: number): boolean {
+    if (this.headBelongsToBlock(cell, homeBlockId, slack)) return true;
+    const owner = this.cellMacroBlockId(cell);
+    if (owner === homeBlockId) return true;
+    const home = this.macroBlocks.find((block) => block.id === homeBlockId);
+    const other = owner === undefined ? undefined : this.macroBlocks.find((block) => block.id === owner);
+    if (!home || !other) return true;
+    const homeDist = Math.abs(cell.row - home.row) + Math.abs(cell.col - home.col);
+    const otherDist = Math.abs(cell.row - other.row) + Math.abs(cell.col - other.col);
+    return homeDist <= otherDist + slack;
+  }
+
+  private expandActiveBlockRadius(): void {
+    if (this.activeBlockId === null) return;
+    const home = this.macroBlocks.find((block) => block.id === this.activeBlockId);
+    if (!home) return;
+    home.radius = Math.min(this.macroRadiusCap, home.radius + 2);
+  }
+
+  private pickNearHomeRay(
+    placed: ArrowDefinition[],
+    occupancy: OccupancyGrid,
+    matrix: CellValue[][],
+    rng: SeededRandom,
+    homeBlockId: number,
+  ): Set<string> {
+    const home = this.macroBlocks.find((block) => block.id === homeBlockId);
+    if (!home || placed.length === 0) {
+      return this.pickFocusRay(placed, occupancy, matrix, rng, 'oldest');
+    }
+    const byId = new Map(placed.map((arrow) => [arrow.id, arrow]));
+    const cache = this.rays;
+    const ids = cache && cache.unblocked.length > 0 ? cache.unblocked : placed.map((arrow) => arrow.id);
+    const preferForeign = rng.next() < 0.6;
+    let best: Set<string> | null = null;
+    let bestScore = Number.POSITIVE_INFINITY;
+    for (const id of ids) {
+      const arrow = byId.get(id);
+      if (!arrow) continue;
+      const ray = cache?.byId.get(id)?.cellSet ?? this.collectRay(arrow, occupancy, matrix);
+      if (!ray || ray.size === 0) continue;
+      let nearest = Number.POSITIVE_INFINITY;
+      for (const key of ray) {
+        const [row, col] = key.split(',').map(Number);
+        const dist = Math.abs(row - home.row) + Math.abs(col - home.col);
+        if (dist < nearest) nearest = dist;
+      }
+      if (!Number.isFinite(nearest)) continue;
+      const foreign = arrow.blockId !== undefined && arrow.blockId !== homeBlockId;
+      const score = nearest + (preferForeign && !foreign ? 8 : 0) + (foreign ? 0 : 3);
+      if (score < bestScore) {
+        bestScore = score;
+        best = ray instanceof Set ? new Set(ray) : new Set(ray);
+      }
+    }
+    return best && bestScore <= home.radius + 10
+      ? best
+      : this.pickFocusRay(placed, occupancy, matrix, rng, 'oldest');
+  }
+
+  private rollMacroCluster(
+    rng: SeededRandom,
+    arrows: ArrowDefinition[],
+    occupancy: OccupancyGrid,
+    matrix: CellValue[][],
+    consecutiveFailures: number,
+  ): boolean {
+    if (this.macroBlocks.length < 2) {
+      this.activeBlockId = null;
+      this.lastVisitedBlockId = null;
+      this.lastCommittedBlockId = null;
+      this.pendingBridgeRay = null;
+      this.bridgeHuntActive = false;
+      return false;
+    }
+    if (consecutiveFailures >= 8) this.clusterPlaced = this.clusterBudget;
+    if (this.clusterPlaced < this.clusterBudget) return false;
+
+    this.lastVisitedBlockId = this.activeBlockId;
+    const count = this.macroBlocks.length;
+    for (let step = 0; step < count; step++) {
+      this.macroRobinIndex = (this.macroRobinIndex + 1) % count;
+      this.activeBlockId = this.macroBlocks[this.macroRobinIndex].id;
+      if (this.activeBlockId !== this.lastCommittedBlockId || count < 3) break;
+    }
+    this.clusterBudget = rng.nextInt(1, 5);
+    this.clusterPlaced = 0;
+    this.lastBlockCrossedBorder = false;
+    this.pendingBridgeRay =
+      arrows.length === 0
+        ? null
+        : this.pickForeignBlockRay(arrows, occupancy, matrix, this.lastVisitedBlockId, this.activeBlockId);
+    return true;
+  }
+
+  private pickForeignBlockRay(
+    placed: ArrowDefinition[],
+    occupancy: OccupancyGrid,
+    matrix: CellValue[][],
+    preferBlockId: number | null,
+    excludeBlockId: number | null,
+  ): Set<string> {
+    const byId = new Map(placed.map((arrow) => [arrow.id, arrow]));
+    const preferred: Set<string>[] = [];
+    const foreign: Set<string>[] = [];
+    const any: Set<string>[] = [];
+    const cache = this.rays;
+    const ids = cache && cache.unblocked.length > 0 ? cache.unblocked : placed.map((arrow) => arrow.id);
+    for (const id of ids) {
+      const arrow = byId.get(id);
+      if (!arrow) continue;
+      const ray = cache?.byId.get(id)?.cellSet ?? this.collectRay(arrow, occupancy, matrix);
+      if (!ray || ray.size === 0) continue;
+      const copy = ray instanceof Set ? new Set(ray) : ray;
+      any.push(copy);
+      if (excludeBlockId !== null && arrow.blockId === excludeBlockId) continue;
+      foreign.push(copy);
+      if (preferBlockId !== null && arrow.blockId === preferBlockId) preferred.push(copy);
+    }
+    const pool = preferred.length > 0 ? preferred : foreign.length > 0 ? foreign : any;
+    const home = excludeBlockId === null ? null : this.macroBlocks.find((block) => block.id === excludeBlockId) ?? null;
+    if (!home || pool.length === 0) return pool[0] ?? new Set();
+    let best = pool[0];
+    let bestDist = Number.POSITIVE_INFINITY;
+    for (const ray of pool) {
+      let nearest = Number.POSITIVE_INFINITY;
+      for (const key of ray) {
+        const [row, col] = key.split(',').map(Number);
+        const dist = Math.abs(row - home.row) + Math.abs(col - home.col);
+        if (dist < nearest) nearest = dist;
+      }
+      if (nearest < bestDist) {
+        bestDist = nearest;
+        best = ray;
+      }
+    }
+    return best ?? new Set();
+  }
+
+  private noteMacroCommit(arrow: ArrowDefinition): void {
+    if (this.macroBlocks.length < 2) return;
+    const head = arrow.cells[arrow.cells.length - 1];
+    arrow.blockId = this.activeBlockId ?? this.cellMacroBlockId(head);
+    this.lastCommittedBlockId = arrow.blockId ?? null;
+    this.clusterPlaced += 1;
+    this.pendingBridgeRay = null;
+    this.bridgeHuntActive = false;
+    this.lastBlockCrossedBorder =
+      arrow.blockId !== undefined && this.arrowCrossesBlockBorder(arrow, arrow.blockId);
+  }
+
+  private arrowCrossesBlockBorder(arrow: ArrowDefinition, homeBlockId: number): boolean {
+    for (const cell of arrow.cells) {
+      const owner = this.cellMacroBlockId(cell);
+      if (owner !== undefined && owner !== homeBlockId) return true;
+    }
+    return false;
+  }
+
+  private assignSolveIndices(arrows: ArrowDefinition[], solved?: ArrowDefinition[]): void {
+    if (arrows.length === 0) return;
+    if (solved && solved.length === arrows.length) {
+      const byId = new Map(arrows.map((arrow) => [arrow.id, arrow]));
+      solved.forEach((arrow, index) => {
+        const target = byId.get(arrow.id);
+        if (target) target.solveIndex = index + 1;
+      });
+      return;
+    }
+    for (let index = 0; index < arrows.length; index++) {
+      arrows[index].solveIndex = arrows.length - index;
+    }
+  }
+
   private inferDifficulty(occupiedCells: number, floorCells: number): Difficulty {
     const density = floorCells === 0 ? 0 : occupiedCells / floorCells;
     if (density < 0.18) return 'easy';
     if (density < 0.32) return 'medium';
     return 'hard';
   }
+}
+
+function qualityKnobs(quality: GenerationQuality): QualityKnobs {
+  if (quality === 'fast') {
+    return {
+      coreTarget: 0.84,
+      packTarget: 0.91,
+      fillTarget: 0.93,
+      maxCrumbShare: 0,
+      maxAttemptsCap: 400,
+      saturationRetries: 56,
+      packFailBudgetScale: 0.85,
+      extraPackPasses: false,
+    };
+  }
+  if (quality === 'quality') {
+    return {
+      coreTarget: 0.88,
+      packTarget: 0.94,
+      fillTarget: 0.96,
+      maxCrumbShare: 0,
+      maxAttemptsCap: 900,
+      saturationRetries: 100,
+      packFailBudgetScale: 1.25,
+      extraPackPasses: true,
+    };
+  }
+  return {
+    coreTarget: 0.86,
+    packTarget: 0.93,
+    fillTarget: 0.95,
+    maxCrumbShare: 0,
+    maxAttemptsCap: 560,
+    saturationRetries: 64,
+    packFailBudgetScale: 1.0,
+    extraPackPasses: true,
+  };
 }
 
 function resolveGenerationSeed(options: SLevelGeneratorOptions): number {
@@ -2961,9 +3857,9 @@ function mixSeed(index: number, salt: number): number {
 export function generateSLevel(
   sLevelIndex: number,
   seed?: number,
-  extras?: Pick<SLevelGeneratorOptions, 'forceRandomize' | 'randomSalt'>,
+  extras?: Pick<SLevelGeneratorOptions, 'forceRandomize' | 'randomSalt' | 'quality'>,
 ): Level {
-  return new SLevelGenerator().generate({ sLevelIndex, seed, ...extras });
+  return new SLevelGenerator().generate({ sLevelIndex, seed, quality: 'quality', ...extras });
 }
 
 /** Pack leftover floor on an existing board using the generator's fill passes. */

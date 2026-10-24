@@ -159,3 +159,11 @@ export function isFloorCell(grid: LevelGrid, row: number, col: number): boolean 
 export function isBlockerCell(grid: LevelGrid, row: number, col: number): boolean {
   return grid.matrix[row]?.[col] === CELL_BLOCKER;
 }
+
+/** Board-pixel → grid cell, or null if outside the grid bounds. */
+export function cellAtBoard(boardX: number, boardY: number, layout: Layout, grid: LevelGrid): GridCell | null {
+  const col = Math.floor((boardX - layout.originX) / layout.cellSize);
+  const row = Math.floor((boardY - layout.originY) / layout.cellSize);
+  if (row < 0 || col < 0 || row >= grid.rows || col >= grid.cols) return null;
+  return { row, col };
+}

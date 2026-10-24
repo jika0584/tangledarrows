@@ -7,7 +7,7 @@ import {
 } from '../levels/types';
 import { escapableArrowIds, isSolvable } from '../game/engine/WinCondition';
 import { createBoardState } from '../game/engine/Movement';
-import { SLevelGenerator } from './SLevelGenerator';
+import { SLevelGenerator, GenerationQuality } from './SLevelGenerator';
 
 /** First numbered campaign board. */
 export const FIRST_CURATED_LEVEL = 1;
@@ -50,6 +50,8 @@ export interface GenerateCuratedOptions {
   seed?: number;
   /** Visible grid including the pass-through ring. Overrides the campaign curve. */
   storedSize?: number;
+  /** Packing aggressiveness / attempt budget inside each seed. */
+  quality?: GenerationQuality;
 }
 
 const generator = new SLevelGenerator();
@@ -91,15 +93,16 @@ export function generateCuratedLevel(
   const profile = tuneProfile(profileForLevel(levelNumber), options.storedSize);
   const matrix = borderedMatrix(profile.interiorSize);
   const attempts = Math.max(1, options.seedAttempts ?? 8);
+  const quality = options.quality ?? 'normal';
 
   if (options.seed !== undefined) {
-    return stamp(build(profile, matrix, options.seed), profile, options.seed);
+    return stamp(build(profile, matrix, options.seed, quality), profile, options.seed);
   }
 
   const candidates: { level: Level; seed: number }[] = [];
   for (let attempt = 0; attempt < attempts; attempt++) {
     const seed = seedFor(levelNumber, attempt);
-    const level = build(profile, matrix, seed);
+    const level = build(profile, matrix, seed, quality);
     if (isSolvable(level) && level.arrows.length > 0) {
       candidates.push({ level, seed });
     }
@@ -107,7 +110,7 @@ export function generateCuratedLevel(
 
   if (candidates.length === 0) {
     const seed = seedFor(levelNumber, 0);
-    return stamp(build(profile, matrix, seed), profile, seed);
+    return stamp(build(profile, matrix, seed, quality), profile, seed);
   }
 
   const picked = pickCandidate(candidates, profile.prefer);
@@ -142,7 +145,12 @@ export function asciiPreview(level: Level): string {
     .join('\n');
 }
 
-function build(profile: CuratedProfile, matrix: CellValue[][], seed: number): Level {
+function build(
+  profile: CuratedProfile,
+  matrix: CellValue[][],
+  seed: number,
+  quality: GenerationQuality = 'normal',
+): Level {
   return generator.generate({
     sLevelIndex: profile.levelNumber,
     seed,
@@ -151,6 +159,7 @@ function build(profile: CuratedProfile, matrix: CellValue[][], seed: number): Le
     maxArrowLength: profile.maxArrowLength,
     maxTailLength: profile.maxTailLength,
     minArrows: profile.minArrows,
+    quality,
   });
 }
 

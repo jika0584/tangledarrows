@@ -30,14 +30,27 @@ export function comboPoints(comboSize: number): number {
   return 300 + (comboSize - 5) * 80;
 }
 
+export function comboSizeLabel(comboSize: number): string {
+  if (comboSize === 2) return 'Double';
+  if (comboSize === 3) return 'Triple';
+  if (comboSize === 4) return 'Quad';
+  if (comboSize === 5) return 'Penta';
+  return `${comboSize}`;
+}
+
+/** Base time table ×10 so time dominates the final total. */
 export function timeBonusPoints(elapsedMs: number): number {
   const minutes = elapsedMs / 60_000;
-  if (minutes < 3) return 3000;
-  if (minutes < 4) return 2500;
-  if (minutes < 5) return 2200;
-  if (minutes < 6) return 2000;
-  const extraMinutes = Math.floor(minutes - 6);
-  return Math.max(500, 2000 - extraMinutes * 200);
+  let base: number;
+  if (minutes < 3) base = 3000;
+  else if (minutes < 4) base = 2500;
+  else if (minutes < 5) base = 2200;
+  else if (minutes < 6) base = 2000;
+  else {
+    const extraMinutes = Math.floor(minutes - 6);
+    base = Math.max(500, 2000 - extraMinutes * 200);
+  }
+  return base * 10;
 }
 
 export function computeLevelScore(input: LevelScoreInput): LevelScoreResult {
@@ -61,13 +74,25 @@ export function computeLevelScore(input: LevelScoreInput): LevelScoreResult {
     });
   }
 
-  const timePoints = timeBonusPoints(input.elapsedMs);
-  lines.push({ label: 'Time bonus', points: timePoints });
+  lines.push({ label: 'Time bonus', points: timeBonusPoints(input.elapsedMs) });
 
-  for (const comboSize of input.comboPayouts) {
+  // Aggregate identical combo sizes: "5 × Double combo", "10 × 13 combo", …
+  const bySize = new Map<number, { count: number; points: number }>();
+  for (const size of input.comboPayouts) {
+    if (size < 2) continue;
+    const existing = bySize.get(size) ?? { count: 0, points: 0 };
+    existing.count += 1;
+    existing.points += comboPoints(size);
+    bySize.set(size, existing);
+  }
+
+  const sizes = [...bySize.keys()].sort((a, b) => a - b);
+  for (const size of sizes) {
+    const { count, points } = bySize.get(size)!;
+    const name = comboSizeLabel(size);
     lines.push({
-      label: `Combo x${comboSize}`,
-      points: comboPoints(comboSize),
+      label: `${count} × ${name} combo`,
+      points,
     });
   }
 

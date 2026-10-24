@@ -1,4 +1,4 @@
-# Amaze Escape
+# Tangled Arrows
 
 A premium, ad-free sliding-arrow puzzle game for Android. Tap an arrow head and it
 snakes off in the direction it points — body trailing behind the head — until it

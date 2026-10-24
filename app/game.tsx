@@ -1,4 +1,10 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import React, {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import {
   ActivityIndicator,
   AppState,
@@ -6,45 +12,70 @@ import {
   StyleSheet,
   Text,
   View,
-} from 'react-native';
-import { useRouter, useLocalSearchParams } from 'expo-router';
-import { SafeAreaView } from 'react-native-safe-area-context';
-import { Level } from '../src/levels/types';
-import { LevelRepository } from '../src/sync/LevelRepository';
-import { useProgressStore } from '../src/store/progressStore';
+} from "react-native";
+import { useRouter, useLocalSearchParams } from "expo-router";
+import { SafeAreaView } from "react-native-safe-area-context";
+import { Level } from "../src/levels/types";
+import { LevelRepository } from "../src/sync/LevelRepository";
+import {
+  HighScoreBoard,
+  HighScoreRepository,
+} from "../src/sync/HighScoreRepository";
+import { useHighScoreRefresh } from "../src/sync/useHighScoreRefresh";
+import { useProgressStore } from "../src/store/progressStore";
 import {
   RunCache,
   clearRunCache,
   isResumable,
   loadRunCache,
   saveRunCache,
-} from '../src/store/runCache';
-import { useBoard } from '../src/game/hooks/useBoard';
-import { formatElapsed, useElapsedTimer } from '../src/game/hooks/useElapsedTimer';
-import { fitBoardToViewport } from '../src/game/rendering/Camera';
-import { pickProgressMilestoneTints, progressArrowTint } from '../src/game/rendering/progressTint';
-import { describeEscape, PROGRESS_TOASTS, EscapeEvent } from '../src/game/encouragement';
-import { computeLevelScore } from '../src/game/scoring/levelScore';
-import { GameCanvas } from '../src/components/GameCanvas';
-import { Hud } from '../src/components/Hud';
-import { LevelOverlay } from '../src/components/LevelOverlay';
-import { ProgressCheer } from '../src/components/ProgressCheer';
-import { ComboBanner } from '../src/components/ComboBanner';
-import { ClearFlair } from '../src/components/ClearFlair';
-import { EncouragementToast, useEncouragementToasts } from '../src/components/EncouragementToast';
-import { RulerToggle } from '../src/components/RulerToggle';
-import { SettingsMenu } from '../src/components/SettingsMenu';
-import { WinCelebration } from '../src/components/WinCelebration';
-import { SHOW_DEV_TOOLS } from '../src/dev/flags';
-import { useSettingsStore } from '../src/store/settingsStore';
-import { spacing, typography, useColors } from '../src/theme/theme';
-import { DEMO_ENDING_LEVEL, DEMO_ENDING_LEVEL_ID } from '../src/levels/demoEnding';
+} from "../src/store/runCache";
+import { useBoard } from "../src/game/hooks/useBoard";
+import {
+  formatElapsed,
+  useElapsedTimer,
+} from "../src/game/hooks/useElapsedTimer";
+import { fitBoardToViewport } from "../src/game/rendering/Camera";
+import {
+  pickProgressMilestoneTints,
+  progressArrowTint,
+} from "../src/game/rendering/progressTint";
+import {
+  describeEscape,
+  PROGRESS_TOASTS,
+  EscapeEvent,
+} from "../src/game/encouragement";
+import { computeLevelScore } from "../src/game/scoring/levelScore";
+import { GameCanvas } from "../src/components/GameCanvas";
+import { Hud } from "../src/components/Hud";
+import { LevelOverlay } from "../src/components/LevelOverlay";
+import { ProgressCheer } from "../src/components/ProgressCheer";
+import { ComboBanner } from "../src/components/ComboBanner";
+import { ClearFlair } from "../src/components/ClearFlair";
+import {
+  EncouragementToast,
+  useEncouragementToasts,
+} from "../src/components/EncouragementToast";
+import { RotatedStage, StageSafeArea } from "../src/components/RotatedStage";
+import { RotateToggle } from "../src/components/RotateToggle";
+import { RulerToggle } from "../src/components/RulerToggle";
+import { SettingsMenu } from "../src/components/SettingsMenu";
+import { WinCelebration } from "../src/components/WinCelebration";
+import { SHOW_DEV_TOOLS } from "../src/dev/flags";
+import { useSettingsStore } from "../src/store/settingsStore";
+import { spacing, typography, useColors } from "../src/theme/theme";
+import {
+  DEMO_ENDING_LEVEL,
+  DEMO_ENDING_LEVEL_ID,
+} from "../src/levels/demoEnding";
 
 export default function GameScreen() {
   const router = useRouter();
-  const { sandbox: sandboxParam } = useLocalSearchParams<{ sandbox?: string | string[] }>();
+  const { sandbox: sandboxParam } = useLocalSearchParams<{
+    sandbox?: string | string[];
+  }>();
   const sandbox = Array.isArray(sandboxParam) ? sandboxParam[0] : sandboxParam;
-  const isDemo = SHOW_DEV_TOOLS && sandbox === 'ending';
+  const isDemo = SHOW_DEV_TOOLS && sandbox === "ending";
   const {
     hydrated,
     hydrate,
@@ -56,7 +87,9 @@ export default function GameScreen() {
 
   const [level, setLevel] = useState<Level | null>(null);
   const [viewport, setViewport] = useState({ width: 0, height: 0 });
-  const [runCache, setRunCache] = useState<RunCache | null | undefined>(undefined);
+  const [runCache, setRunCache] = useState<RunCache | null | undefined>(
+    undefined,
+  );
 
   useEffect(() => {
     void hydrate();
@@ -97,8 +130,11 @@ export default function GameScreen() {
       if (cancelled) return;
 
       if (resolved.usedFallback && currentCuratedLevel !== null) {
-        // Moves the cursor off the curated tier, which re-runs this effect.
+        // Drop the campaign cursor and show the endless board in the same
+        // turn — returning without setLevel left an infinite loading screen
+        // when the effect re-run raced with cancellation.
         await exhaustCuratedLevels();
+        if (!cancelled) setLevel(resolved.level);
         return;
       }
       setLevel(resolved.level);
@@ -107,17 +143,25 @@ export default function GameScreen() {
     return () => {
       cancelled = true;
     };
-  }, [hydrated, currentCuratedLevel, currentSLevelIndex, exhaustCuratedLevels, isDemo]);
+  }, [
+    hydrated,
+    currentCuratedLevel,
+    currentSLevelIndex,
+    exhaustCuratedLevels,
+    isDemo,
+  ]);
 
   // Replaces rather than pops: the board can be reached from the menu or from
   // the stage picker, and either way "menu" should mean the menu.
-  const goToMenu = useCallback(() => router.replace('/'), [router]);
+  const goToMenu = useCallback(() => router.replace("/"), [router]);
 
   const colors = useColors();
 
   if (!level || !hydrated || (!isDemo && runCache === undefined)) {
     return (
-      <SafeAreaView style={[styles.loading, { backgroundColor: colors.background }]}>
+      <SafeAreaView
+        style={[styles.loading, { backgroundColor: colors.background }]}
+      >
         <ActivityIndicator size="large" color={colors.arrow} />
         <Text style={[styles.loadingLabel, { color: colors.textSecondary }]}>
           Preparing your maze…
@@ -126,7 +170,8 @@ export default function GameScreen() {
     );
   }
 
-  const restored = isResumable(runCache) && runCache.levelId === level.id ? runCache : null;
+  const restored =
+    isResumable(runCache) && runCache.levelId === level.id ? runCache : null;
 
   return (
     <Board
@@ -137,6 +182,7 @@ export default function GameScreen() {
       viewport={viewport}
       onViewportChange={setViewport}
       onHome={goToMenu}
+      onChooseLevel={() => router.push("/stages")}
       onAdvance={async () => {
         if (isDemo || level.id === DEMO_ENDING_LEVEL_ID) {
           goToMenu();
@@ -159,6 +205,7 @@ interface BoardProps {
   onViewportChange: (size: { width: number; height: number }) => void;
   onAdvance: () => void;
   onHome: () => void;
+  onChooseLevel: () => void;
 }
 
 function Board({
@@ -169,13 +216,22 @@ function Board({
   onViewportChange,
   onAdvance,
   onHome,
+  onChooseLevel,
 }: BoardProps) {
   const router = useRouter();
   const colors = useColors();
   const heartsEnabled = useSettingsStore((state) => state.heartsEnabled);
+  const progressTintsEnabled = useSettingsStore(
+    (state) => state.progressTintsEnabled,
+  );
   const { toast, showToast } = useEncouragementToasts();
   const progressShown = useRef(new Set<number>());
   const progressPrevRatio = useRef(1);
+  const scoreSubmitted = useRef(false);
+  const [highScoreBoard, setHighScoreBoard] = useState<HighScoreBoard | null>(
+    null,
+  );
+  const [highScoresLoading, setHighScoresLoading] = useState(false);
 
   const handleEscape = useCallback(
     (event: EscapeEvent) => {
@@ -185,20 +241,41 @@ function Board({
     [showToast],
   );
 
-  const { state, animations, failedArrowIds, combo, comboPayouts, mistakeCount, hadMistake, tapArrow, onArrowAnimationEnd, restart, continueAnyway } = useBoard(
-    level,
-    restored,
-    { heartsEnabled, onEscape: handleEscape },
+  const {
+    state,
+    animations,
+    failedArrowIds,
+    combo,
+    comboPayouts,
+    mistakeCount,
+    hadMistake,
+    tapArrow,
+    onArrowAnimationEnd,
+    restart,
+    continueAnyway,
+  } = useBoard(level, restored, { heartsEnabled, onEscape: handleEscape });
+  const [milestoneTints, setMilestoneTints] = useState(() =>
+    pickProgressMilestoneTints(),
   );
-  const [milestoneTints, setMilestoneTints] = useState(() => pickProgressMilestoneTints());
   const [rulerActive, setRulerActive] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const toggleRuler = useCallback(() => setRulerActive((on) => !on), []);
+  const landscapeMode = useSettingsStore((state) => state.landscapeMode);
+  const setLandscapeMode = useSettingsStore((state) => state.setLandscapeMode);
+  const toggleLandscape = useCallback(
+    () => void setLandscapeMode(!landscapeMode),
+    [landscapeMode, setLandscapeMode],
+  );
   const [resultElapsed, setResultElapsed] = useState<number | null>(null);
 
-  const playing = state.status === 'playing';
+  const playing = state.status === "playing";
+  const timerActive = playing && state.moves > 0;
   const persistEnabled = useRef(persistProgress);
-  const { getElapsed, reset } = useElapsedTimer(playing, restored?.elapsedMs ?? 0);
+  const { getElapsed, reset } = useElapsedTimer(
+    timerActive,
+    restored?.elapsedMs ?? 0,
+  );
+  useHighScoreRefresh(level.id);
 
   const snapshotRef = useRef({
     levelId: level.id,
@@ -219,8 +296,12 @@ function Board({
 
   const persistOrClear = useCallback(() => {
     const snap = snapshotRef.current;
-    if (!persistEnabled.current || snap.status !== 'playing' || snap.moves === 0) {
-      if (!persistEnabled.current || snap.status !== 'playing') {
+    if (
+      !persistEnabled.current ||
+      snap.status !== "playing" ||
+      snap.moves === 0
+    ) {
+      if (!persistEnabled.current || snap.status !== "playing") {
         void clearRunCache();
       }
       return;
@@ -247,8 +328,8 @@ function Board({
   ]);
 
   useEffect(() => {
-    const sub = AppState.addEventListener('change', (next) => {
-      if (next !== 'active') persistOrClear();
+    const sub = AppState.addEventListener("change", (next) => {
+      if (next !== "active") persistOrClear();
     });
     return () => {
       persistOrClear();
@@ -257,7 +338,7 @@ function Board({
   }, [persistOrClear]);
 
   useEffect(() => {
-    if (state.status === 'playing') {
+    if (state.status === "playing") {
       setResultElapsed(null);
       return;
     }
@@ -299,19 +380,23 @@ function Board({
   }, [onAdvance]);
 
   useEffect(() => {
-    if (!heartsEnabled && state.status === 'lost') continueAnyway();
+    if (!heartsEnabled && state.status === "lost") continueAnyway();
   }, [heartsEnabled, state.status, continueAnyway]);
 
-  const arrowsLeft = state.arrows.filter((arrow) => animations[arrow.id]?.kind !== 'escape').length;
-  const arrowTint = progressArrowTint(
-    level.arrows.length > 0 ? arrowsLeft / level.arrows.length : 1,
-    colors.arrow,
-    milestoneTints,
-  );
+  const arrowsLeft = state.arrows.filter(
+    (arrow) => animations[arrow.id]?.kind !== "escape",
+  ).length;
+  const arrowTint = progressTintsEnabled
+    ? progressArrowTint(
+        level.arrows.length > 0 ? arrowsLeft / level.arrows.length : 1,
+        colors.arrow,
+        milestoneTints,
+      )
+    : colors.arrow;
   const elapsedLabel = formatElapsed(resultElapsed ?? getElapsed());
 
   const scoreResult = useMemo(() => {
-    if (state.status !== 'won' || resultElapsed == null) return null;
+    if (state.status !== "won" || resultElapsed == null) return null;
     return computeLevelScore({
       elapsedMs: resultElapsed,
       heartsEnabled,
@@ -329,6 +414,44 @@ function Board({
     mistakeCount,
     comboPayouts,
   ]);
+
+  const refreshHighScores = useCallback(async () => {
+    setHighScoresLoading(true);
+    try {
+      const board = await HighScoreRepository.fetch(level.id, { force: true });
+      setHighScoreBoard(board);
+    } finally {
+      setHighScoresLoading(false);
+    }
+  }, [level.id]);
+
+  const submitHighScore = useCallback(async () => {
+    if (scoreResult == null) return;
+    setHighScoresLoading(true);
+    try {
+      const board = await HighScoreRepository.submit(
+        level.id,
+        scoreResult.total,
+      );
+      setHighScoreBoard(board);
+    } finally {
+      setHighScoresLoading(false);
+    }
+  }, [level.id, scoreResult]);
+
+  useEffect(() => {
+    scoreSubmitted.current = false;
+    setHighScoreBoard(null);
+  }, [level.id]);
+
+  const handleOpenLeaderboard = useCallback(() => {
+    if (scoreSubmitted.current) {
+      void refreshHighScores();
+      return;
+    }
+    scoreSubmitted.current = true;
+    void submitHighScore();
+  }, [refreshHighScores, submitHighScore]);
 
   useEffect(() => {
     progressShown.current.clear();
@@ -353,72 +476,97 @@ function Board({
     }
   }, [arrowsLeft, level.arrows.length, playing, showToast]);
 
-  const levelLabel = level.id === DEMO_ENDING_LEVEL_ID
-    ? 'Ending test'
-    : level.id.startsWith('S')
-      ? `Endless ${level.id.slice(1)}`
-      : `Level ${level.id}`;
+  const levelLabel =
+    level.id === DEMO_ENDING_LEVEL_ID
+      ? "Ending test"
+      : level.id.startsWith("S")
+        ? `Endless ${level.id.slice(1)}`
+        : `Level ${level.id}`;
+
+  // The controls hint only earns its screen space while the player is learning.
+  const showHint = level.id === "1";
 
   return (
-    <SafeAreaView style={[styles.screen, { backgroundColor: colors.background }]} edges={['top', 'bottom']}>
+    <RotatedStage landscape={landscapeMode} backgroundColor={colors.background}>
+      <StageSafeArea>
+        <View style={styles.canvasArea} onLayout={handleLayout}>
+          {layout && (
+            <GameCanvas
+              grid={level.grid}
+              arrows={state.arrows}
+              layout={layout}
+              width={viewport.width}
+              height={viewport.height}
+              animations={animations}
+              failedArrowIds={failedArrowIds}
+              arrowTint={arrowTint}
+              rulerActive={rulerActive}
+              onArrowTap={tapArrow}
+              onArrowAnimationEnd={onArrowAnimationEnd}
+            />
+          )}
+          <RulerToggle active={rulerActive} onToggle={toggleRuler} />
+          <RotateToggle landscape={landscapeMode} onToggle={toggleLandscape} />
+        </View>
+
+        {showHint ? (
+          <Text
+            style={[styles.hint, { color: colors.textSecondary }]}
+            accessibilityRole="text"
+          >
+            Tap an arrow head to send it out. Drag to pan, pinch to zoom.
+          </Text>
+        ) : null}
+      </StageSafeArea>
+
+      {/* After the board so it paints on top; it floats rather than taking a
+          row of its own. */}
       <Hud
         levelLabel={levelLabel}
         lives={state.lives}
         arrowsLeft={arrowsLeft}
         heartsEnabled={heartsEnabled}
-        onRestart={handleRestart}
         onSkip={SHOW_DEV_TOOLS ? handleAdvance : undefined}
         onSettings={() => setSettingsOpen(true)}
+        messages={
+          <>
+            <ComboBanner combo={combo} />
+            <ProgressCheer
+              arrowsLeft={arrowsLeft}
+              arrowTotal={level.arrows.length}
+              playing={playing}
+            />
+            <EncouragementToast message={toast} />
+          </>
+        }
       />
 
-      <View style={styles.canvasArea} onLayout={handleLayout}>
-        {layout && (
-          <GameCanvas
-            grid={level.grid}
-            arrows={state.arrows}
-            layout={layout}
-            width={viewport.width}
-            height={viewport.height}
-            animations={animations}
-            failedArrowIds={failedArrowIds}
-            arrowTint={arrowTint}
-            rulerActive={rulerActive}
-            onArrowTap={tapArrow}
-            onArrowAnimationEnd={onArrowAnimationEnd}
-          />
-        )}
-        <RulerToggle active={rulerActive} onToggle={toggleRuler} />
-        <ProgressCheer
-          arrowsLeft={arrowsLeft}
-          arrowTotal={level.arrows.length}
-          playing={playing}
-        />
-        <ComboBanner combo={combo} />
-        <EncouragementToast message={toast} />
-      </View>
-
-      <Text style={[styles.hint, { color: colors.textSecondary }]} accessibilityRole="text">
-        Tap an arrow head to send it out. Drag to pan, pinch to zoom.
-      </Text>
-
-      {state.status === 'won' && (
+      {state.status === "won" && (
         <>
+          <WinCelebration active />
           <LevelOverlay
             kind="won"
             elapsedLabel={elapsedLabel}
             scoreLines={scoreResult?.lines}
             totalScore={scoreResult?.total}
+            scoreRevealKey={
+              resultElapsed != null ? `${level.id}-${resultElapsed}` : undefined
+            }
+            highScoreBoard={highScoreBoard}
+            highScoresLoading={highScoresLoading}
+            onOpenLeaderboard={handleOpenLeaderboard}
             onPrimary={handleAdvance}
             onSecondary={handleRestart}
+            onHome={onHome}
+            onChooseLevel={onChooseLevel}
           />
-          <WinCelebration active />
           <ClearFlair
             perfect={!hadMistake}
             firstTry={heartsEnabled && state.lives > 0}
           />
         </>
       )}
-      {heartsEnabled && state.status === 'lost' && (
+      {heartsEnabled && state.status === "lost" && (
         <LevelOverlay
           kind="lost"
           elapsedLabel={elapsedLabel}
@@ -429,39 +577,43 @@ function Board({
 
       <SettingsMenu
         visible={settingsOpen}
+        // A Modal opens its own window, which never inherits the stage's
+        // rotation, so the turned board needs the inline overlay instead.
+        inline={landscapeMode}
         onClose={() => setSettingsOpen(false)}
+        onRestart={() => {
+          setSettingsOpen(false);
+          handleRestart();
+        }}
         onChangeLevel={() => {
           setSettingsOpen(false);
-          router.push('/stages');
+          router.push("/stages");
         }}
         onReturnHome={() => {
           setSettingsOpen(false);
           onHome();
         }}
       />
-    </SafeAreaView>
+    </RotatedStage>
   );
 }
 
 const styles = StyleSheet.create({
-  screen: {
-    flex: 1,
-  },
   canvasArea: {
     flex: 1,
     marginHorizontal: spacing.sm,
-    position: 'relative',
+    position: "relative",
   },
   hint: {
     ...typography.body,
-    textAlign: 'center',
+    textAlign: "center",
     paddingHorizontal: spacing.md,
     paddingBottom: spacing.md,
   },
   loading: {
     flex: 1,
-    alignItems: 'center',
-    justifyContent: 'center',
+    alignItems: "center",
+    justifyContent: "center",
     gap: spacing.md,
   },
   loadingLabel: {

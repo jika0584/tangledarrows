@@ -1,7 +1,7 @@
-import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { StyleSheet, Text, View } from 'react-native';
-import Animated, { FadeInRight, FadeOutRight } from 'react-native-reanimated';
-import { spacing, typography, useColors } from '../theme/theme';
+import React, { useCallback, useEffect, useRef, useState } from "react";
+import { StyleSheet, Text, View } from "react-native";
+import Animated, { FadeInLeft, FadeOutLeft } from "react-native-reanimated";
+import { spacing, typography, useColors } from "../theme/theme";
 
 export interface EncouragementMessage {
   id: number;
@@ -21,13 +21,20 @@ export function EncouragementToast({ message }: EncouragementToastProps) {
     <Animated.View
       key={message.id}
       pointerEvents="none"
-      entering={FadeInRight.duration(180)}
-      exiting={FadeOutRight.duration(220)}
+      entering={FadeInLeft.duration(180)}
+      exiting={FadeOutLeft.duration(220)}
       style={styles.wrap}
     >
-      <View style={[styles.bubble, { backgroundColor: colors.surface, shadowColor: colors.textPrimary }]}>
+      <View
+        style={[
+          styles.bubble,
+          { backgroundColor: colors.surface, shadowColor: colors.textPrimary },
+        ]}
+      >
         <Text style={styles.emoji}>{message.emoji}</Text>
-        <Text style={[styles.label, { color: colors.textPrimary }]}>{message.message}</Text>
+        <Text style={[styles.label, { color: colors.textPrimary }]}>
+          {message.message}
+        </Text>
       </View>
     </Animated.View>
   );
@@ -75,18 +82,15 @@ export function useEncouragementToasts() {
 
 const styles = StyleSheet.create({
   wrap: {
-    position: 'absolute',
-    top: 10,
-    right: 12,
-    zIndex: 32,
-    maxWidth: '62%',
+    alignSelf: "flex-start",
+    maxWidth: 240,
   },
   bubble: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: spacing.sm,
-    paddingHorizontal: spacing.md,
-    paddingVertical: spacing.sm,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: spacing.xs,
+    paddingHorizontal: spacing.sm,
+    paddingVertical: 4,
     borderRadius: 999,
     elevation: 3,
     shadowOpacity: 0.12,
@@ -94,7 +98,7 @@ const styles = StyleSheet.create({
     shadowOffset: { width: 0, height: 2 },
   },
   emoji: {
-    fontSize: 22,
+    fontSize: 18,
   },
   label: {
     ...typography.label,

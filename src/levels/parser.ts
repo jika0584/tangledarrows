@@ -123,6 +123,11 @@ function parseArrows(raw: unknown, grid: LevelGrid): ArrowDefinition[] {
       id,
       cells,
       direction,
+      blockId: typeof a.blockId === 'number' && Number.isFinite(a.blockId) ? Math.floor(a.blockId) : undefined,
+      solveIndex:
+        typeof a.solveIndex === 'number' && Number.isFinite(a.solveIndex)
+          ? Math.max(1, Math.floor(a.solveIndex))
+          : undefined,
       role: a.role === 'crumb' ? 'crumb' : a.role === 'filler' ? 'filler' : undefined,
     };
   });

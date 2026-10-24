@@ -64,37 +64,17 @@ export default function MainMenuScreen() {
       : resumeLabel;
 
   return (
-    <SafeAreaView style={[styles.screen, { backgroundColor: colors.background }]} edges={['top']}>
-      <View style={styles.header}>
-        <Text style={[styles.title, { color: colors.textPrimary }]} accessibilityRole="header">
-          AMAZE
-        </Text>
-        <Text style={[styles.subtitle, { color: colors.textSecondary }]}>ESCAPE</Text>
-        <View style={styles.headerActions}>
-          {SHOW_DEV_TOOLS ? (
-            <Pressable
-              onPress={() => void checkForUpdates()}
-              disabled={checking}
-              accessibilityRole="button"
-              accessibilityLabel="Check for new puzzles"
-              hitSlop={12}
-              style={({ pressed }) => [
-                styles.iconButton,
-                { backgroundColor: colors.surface },
-                pressed && styles.iconPressed,
-              ]}
-            >
-              {checking ? (
-                <ActivityIndicator size="small" color={colors.arrow} />
-              ) : (
-                <Text style={[styles.iconGlyph, { color: colors.textPrimary }]}>↻</Text>
-              )}
-            </Pressable>
-          ) : null}
+    <SafeAreaView
+      style={[styles.screen, { backgroundColor: colors.background }]}
+      edges={['top', 'left', 'right']}
+    >
+      <View style={styles.topBar}>
+        {SHOW_DEV_TOOLS ? (
           <Pressable
-            onPress={() => setSettingsOpen(true)}
+            onPress={() => void checkForUpdates()}
+            disabled={checking}
             accessibilityRole="button"
-            accessibilityLabel="Settings"
+            accessibilityLabel="Check for new puzzles"
             hitSlop={12}
             style={({ pressed }) => [
               styles.iconButton,
@@ -102,9 +82,35 @@ export default function MainMenuScreen() {
               pressed && styles.iconPressed,
             ]}
           >
-            <Text style={[styles.iconGlyph, { color: colors.textPrimary }]}>⚙</Text>
+            {checking ? (
+              <ActivityIndicator size="small" color={colors.arrow} />
+            ) : (
+              <Text style={[styles.iconGlyph, { color: colors.textPrimary }]}>↻</Text>
+            )}
           </Pressable>
-        </View>
+        ) : (
+          <View style={styles.iconSpacer} />
+        )}
+        <Pressable
+          onPress={() => setSettingsOpen(true)}
+          accessibilityRole="button"
+          accessibilityLabel="Settings"
+          hitSlop={12}
+          style={({ pressed }) => [
+            styles.iconButton,
+            { backgroundColor: colors.surface },
+            pressed && styles.iconPressed,
+          ]}
+        >
+          <Text style={[styles.iconGlyph, { color: colors.textPrimary }]}>⚙</Text>
+        </Pressable>
+      </View>
+
+      <View style={styles.header}>
+        <Text style={[styles.title, { color: colors.textPrimary }]} accessibilityRole="header">
+          TANGLED
+        </Text>
+        <Text style={[styles.subtitle, { color: colors.textSecondary }]}>ARROWS</Text>
       </View>
 
       <View style={[styles.actions, { paddingBottom: Math.max(insets.bottom, spacing.xl) }]}>
@@ -151,17 +157,18 @@ const styles = StyleSheet.create({
     flex: 1,
     justifyContent: 'space-between',
     paddingHorizontal: spacing.lg,
-    paddingTop: spacing.xl,
+    paddingTop: spacing.md,
     paddingBottom: spacing.md,
   },
-  headerActions: {
-    position: 'absolute',
-    right: 0,
-    top: '50%',
-    marginTop: -MIN_TOUCH_TARGET / 2,
-    zIndex: 2,
+  topBar: {
     flexDirection: 'row',
+    justifyContent: 'flex-end',
+    alignItems: 'center',
     gap: spacing.sm,
+    minHeight: MIN_TOUCH_TARGET,
+  },
+  iconSpacer: {
+    flex: 1,
   },
   iconButton: {
     width: MIN_TOUCH_TARGET,
@@ -179,17 +186,16 @@ const styles = StyleSheet.create({
   header: {
     flex: 1,
     justifyContent: 'center',
-    position: 'relative',
   },
   title: {
-    fontSize: 64,
+    fontSize: 52,
     fontWeight: '800',
-    letterSpacing: 6,
+    letterSpacing: 4,
     textAlign: 'center',
   },
   subtitle: {
     ...typography.title,
-    letterSpacing: 14,
+    letterSpacing: 10,
     textAlign: 'center',
   },
   actions: {

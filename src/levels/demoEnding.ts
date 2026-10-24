@@ -1,4 +1,4 @@
-import { CELL_FLOOR, CELL_OUTSIDE, Direction, Level } from './types';
+import { CELL_FLOOR, CELL_OUTSIDE, CellValue, Direction, Level } from './types';
 
 /** 7×7 playable board used to check the result overlay, hearts, and cheers. */
 export const DEMO_ENDING_LEVEL_ID = 'demo-ending';
@@ -8,7 +8,7 @@ const F = CELL_FLOOR;
 const PLAYABLE = 7;
 const STORED = PLAYABLE + 2;
 
-function ringMatrix(playable: number): number[][] {
+function ringMatrix(playable: number): CellValue[][] {
   const n = playable + 2;
   return Array.from({ length: n }, (_, row) =>
     Array.from({ length: n }, (_, col) =>

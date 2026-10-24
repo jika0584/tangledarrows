@@ -30,7 +30,7 @@ export function isUploadConfigured(): boolean {
   return supabaseUrl().length > 0 && supabaseServiceRoleKey().length > 0;
 }
 
-/** Writes curated levels to the same `levels` table the app downloads from. */
+/** Writes campaign / endless levels to the same `levels` table the app downloads from. */
 export async function uploadLevels(
   rows: { levelNumber: number; level: Level }[],
 ): Promise<UploadResult> {

@@ -11,9 +11,13 @@ export interface CatalogRow {
 export interface StudioStatus {
   catalogPath: string;
   stored: number;
+  endlessStored: number;
   highest: number | null;
+  highestEndless: number | null;
   pending: number;
+  pendingEndless: number;
   nextLevel: number;
+  nextEndless: number;
   supabase: {
     configured: boolean;
     url: string;
@@ -33,6 +37,7 @@ export interface GenerateRequest {
   storedSizes?: number[];
   shapeFolder?: string;
   alsoUseSquares?: boolean;
+  endless?: boolean;
 }
 
 export interface GenerateShapedRequest {
@@ -49,6 +54,15 @@ export interface GenerateShapedRequest {
 export interface RegenerateRequest {
   spec: string;
   quality: 'fast' | 'normal' | 'quality';
+}
+
+export interface RefreshEndlessRequest {
+  quality: 'fast' | 'normal' | 'quality';
+  starterCount?: number;
+  storedSize?: number;
+  storedSizes?: number[];
+  shapeFolder?: string;
+  alsoUseSquares?: boolean;
 }
 
 export interface GenerateProgress {
@@ -77,13 +91,16 @@ export interface PxApi {
   generate: (request: GenerateRequest) => Promise<{ generated: number[]; skipped: number[]; cancelled?: 'now' | 'after' }>;
   generateShaped: (request: GenerateShapedRequest) => Promise<import('../../../src/levels/types').Level>;
   regenerate: (request: RegenerateRequest) => Promise<{ generated: number[]; skipped: string[]; cancelled?: 'now' | 'after' }>;
+  refreshEndless: (request: RefreshEndlessRequest) => Promise<{ generated: number[]; cancelled?: 'now' | 'after' }>;
   cancelGenerate: (mode: 'now' | 'after') => Promise<void>;
   pickFolder: () => Promise<{ path: string; count: number } | null>;
+  listFolder: (path: string) => Promise<{ path: string; count: number }>;
   onProgress: (handler: (progress: GenerateProgress) => void) => () => void;
   deleteLocal: (levelNumbers: number[]) => Promise<number>;
   deleteCloud: (levelNumbers: number[]) => Promise<{ deleted: number; error?: string }>;
   uploadSelected: (levelNumbers: number[]) => Promise<{ uploaded: number; error?: string }>;
   uploadPending: () => Promise<{ uploaded: number; error?: string }>;
+  uploadEndlessPending: () => Promise<{ uploaded: number; error?: string }>;
   pull: () => Promise<{ pulled: number; error?: string }>;
   saveConfig: (config: CloudConfig) => Promise<StudioStatus>;
   setup: () => Promise<{ status: StudioStatus; message: string; createdProject: boolean }>;

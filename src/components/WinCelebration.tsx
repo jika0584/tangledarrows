@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo } from 'react';
-import { StyleSheet, useWindowDimensions, View } from 'react-native';
+import { StyleSheet, View } from 'react-native';
 import { Canvas, Circle, Group, RoundedRect } from '@shopify/react-native-skia';
 import {
   Easing,
@@ -9,6 +9,7 @@ import {
   withRepeat,
   withTiming,
 } from 'react-native-reanimated';
+import { useStageSize } from './RotatedStage';
 import { colors } from '../theme/theme';
 
 const CONFETTI_COLORS = [
@@ -51,7 +52,7 @@ interface WinCelebrationProps {
 }
 
 export function WinCelebration({ active }: WinCelebrationProps) {
-  const { width, height } = useWindowDimensions();
+  const { width, height } = useStageSize();
   const confettiClock = useSharedValue(0);
   const fireworkClock = useSharedValue(0);
 
@@ -65,7 +66,7 @@ export function WinCelebration({ active }: WinCelebrationProps) {
       return;
     }
     confettiClock.value = 0;
-    confettiClock.value = withTiming(1, { duration: 3800, easing: Easing.linear });
+    confettiClock.value = withTiming(1, { duration: 5200, easing: Easing.linear });
     fireworkClock.value = 0;
     fireworkClock.value = withRepeat(
       withTiming(1, { duration: 2400, easing: Easing.linear }),
@@ -80,7 +81,7 @@ export function WinCelebration({ active }: WinCelebrationProps) {
     <View pointerEvents="none" style={styles.layer}>
       <Canvas style={StyleSheet.absoluteFill}>
         {confetti.map((piece, index) => (
-          <ConfettiPiece key={`c${index}`} piece={piece} clock={confettiClock} duration={3.8} />
+          <ConfettiPiece key={`c${index}`} piece={piece} clock={confettiClock} duration={5.2} />
         ))}
         {sparks.map((spark, index) => (
           <SparkPiece key={`s${index}`} spark={spark} clock={fireworkClock} loopSeconds={2.4} />
@@ -167,9 +168,9 @@ function SparkPiece({
 }
 
 function makeConfetti(width: number, height: number): ConfettiSpec[] {
-  const cannons = [0.18, 0.5, 0.82];
+  const cannons = [0.12, 0.32, 0.5, 0.68, 0.88];
   const pieces: ConfettiSpec[] = [];
-  for (let i = 0; i < 72; i++) {
+  for (let i = 0; i < 120; i++) {
     const cannon = cannons[i % cannons.length];
     pieces.push({
       x0: width * cannon + rand(-36, 36),
@@ -188,16 +189,18 @@ function makeConfetti(width: number, height: number): ConfettiSpec[] {
 
 function makeSparks(width: number, height: number): SparkSpec[] {
   const bursts = [
-    { x: width * 0.22, y: height * 0.28, delay: 0.1 },
-    { x: width * 0.78, y: height * 0.22, delay: 0.45 },
-    { x: width * 0.5, y: height * 0.18, delay: 0.75 },
-    { x: width * 0.3, y: height * 0.38, delay: 1.15 },
-    { x: width * 0.7, y: height * 0.34, delay: 1.5 },
-    { x: width * 0.5, y: height * 0.3, delay: 1.9 },
+    { x: width * 0.18, y: height * 0.24, delay: 0.05 },
+    { x: width * 0.82, y: height * 0.2, delay: 0.35 },
+    { x: width * 0.5, y: height * 0.14, delay: 0.65 },
+    { x: width * 0.28, y: height * 0.34, delay: 1.0 },
+    { x: width * 0.72, y: height * 0.3, delay: 1.35 },
+    { x: width * 0.5, y: height * 0.26, delay: 1.75 },
+    { x: width * 0.38, y: height * 0.18, delay: 2.1 },
+    { x: width * 0.62, y: height * 0.16, delay: 2.45 },
   ];
   const sparks: SparkSpec[] = [];
   for (const burst of bursts) {
-    const count = 18;
+    const count = 22;
     for (let i = 0; i < count; i++) {
       const angle = (Math.PI * 2 * i) / count + rand(-0.12, 0.12);
       const speed = rand(140, 280);
@@ -222,8 +225,12 @@ function rand(min: number, max: number): number {
 
 const styles = StyleSheet.create({
   layer: {
-    ...StyleSheet.absoluteFill,
-    zIndex: 40,
+    position: 'absolute',
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0,
+    zIndex: 45,
   },
 });
 

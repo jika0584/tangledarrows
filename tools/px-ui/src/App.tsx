@@ -19,6 +19,7 @@ import {
   deleteArrows,
   mergeArrows,
   separateArrows,
+  type EditTool,
 } from './editArrows';
 import {
   applyTheme,
@@ -32,6 +33,19 @@ import {
   ThemeMode,
 } from './studioSettings';
 
+type StudioMode = 'campaign' | 'endless';
+
+function isEndlessKey(levelNumber: number): boolean {
+  return levelNumber < 0;
+}
+
+function levelLabel(levelNumber: number): string {
+  return isEndlessKey(levelNumber) ? `S${-levelNumber}` : String(levelNumber);
+}
+
+function formatNextEndless(index: number): string {
+  return `S${Math.max(1, index)}`;
+}
 function errorText(caught: unknown): string {
   if (caught instanceof Error && caught.message) return caught.message;
   if (typeof caught === 'string' && caught.trim()) return caught;
@@ -53,7 +67,9 @@ export function App() {
   const [notice, setNotice] = useState('');
   const [error, setError] = useState('');
   const [progress, setProgress] = useState<GenerateProgress | null>(null);
-  const [panel, setPanel] = useState<'none' | 'generate' | 'single' | 'regenerate' | 'settings'>('none');
+  const [panel, setPanel] = useState<
+    'none' | 'generate' | 'single' | 'regenerate' | 'refresh' | 'settings'
+  >('none');
   const [settingsTab, setSettingsTab] = useState<'general' | 'generator' | 'supabase'>('general');
   const [settings, setSettings] = useState<StudioSettings>(initialSettings);
   const [draftTheme, setDraftTheme] = useState<ThemeMode>(initialSettings.theme);
@@ -67,9 +83,9 @@ export function App() {
   const [genReplace, setGenReplace] = useState(false);
   const sizeChoices = useMemo(() => sizeButtonList(settings.generatorSizes), [settings.generatorSizes]);
   const [genSizes, setGenSizes] = useState<number[]>(() => [...sizeButtonList(initialSettings.generatorSizes)]);
-  const [shapeFolder, setShapeFolder] = useState('');
+  const [shapeFolder, setShapeFolder] = useState(initialSettings.shapeFolder);
   const [shapeFolderCount, setShapeFolderCount] = useState(0);
-  const [alsoUseSquares, setAlsoUseSquares] = useState(false);
+  const [alsoUseSquares, setAlsoUseSquares] = useState(initialSettings.alsoUseSquares);
   const [singleLevel, setSingleLevel] = useState('1');
   const [singleName, setSingleName] = useState('');
   const [singleQuality, setSingleQuality] = useState<'fast' | 'normal' | 'quality'>('normal');
@@ -89,12 +105,15 @@ export function App() {
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState<Level | null>(null);
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
+  const [editTool, setEditTool] = useState<EditTool>('select');
   const [playNonce, setPlayNonce] = useState(0);
-  const [demoToken, setDemoToken] = useState(0);
-  const [demoPlaying, setDemoPlaying] = useState(false);
   const [stopping, setStopping] = useState<'none' | 'now' | 'after'>('none');
   const [showOpen, setShowOpen] = useState(false);
+  const [showStuck, setShowStuck] = useState(false);
+  const [viewMode, setViewMode] = useState<'construction' | 'blocks' | 'solveOrder'>('construction');
   const [deleteMenu, setDeleteMenu] = useState(false);
+  const [studioMode, setStudioMode] = useState<StudioMode>('campaign');
+  const [endlessQuality, setEndlessQuality] = useState<'fast' | 'normal' | 'quality'>('normal');
   const deleteMenuRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -104,6 +123,46 @@ export function App() {
   useEffect(() => {
     applyTheme(initialSettings.theme);
   }, [initialSettings.theme]);
+
+  useEffect(() => {
+    const folder = initialSettings.shapeFolder;
+    if (!folder) return;
+    void window.px.listFolder(folder).then((info) => {
+      setShapeFolder(info.path);
+      setShapeFolderCount(info.count);
+      if (info.count === 0 && !initialSettings.alsoUseSquares) {
+        setAlsoUseSquares(false);
+      }
+    });
+  }, [initialSettings.shapeFolder, initialSettings.alsoUseSquares]);
+
+  function persistShapeSettings(next: {
+    shapeFolder?: string;
+    alsoUseSquares?: boolean;
+  }) {
+    const shapeFolderNext = next.shapeFolder ?? shapeFolder;
+    const alsoUseSquaresNext = next.alsoUseSquares ?? alsoUseSquares;
+    applySettings({
+      ...settings,
+      shapeFolder: shapeFolderNext,
+      alsoUseSquares: alsoUseSquaresNext,
+    });
+  }
+
+  async function pickShapeFolder() {
+    const picked = await window.px.pickFolder();
+    if (!picked) return;
+    setShapeFolder(picked.path);
+    setShapeFolderCount(picked.count);
+    persistShapeSettings({ shapeFolder: picked.path });
+  }
+
+  function clearShapeFolder() {
+    setShapeFolder('');
+    setShapeFolderCount(0);
+    setAlsoUseSquares(false);
+    persistShapeSettings({ shapeFolder: '', alsoUseSquares: false });
+  }
 
   useEffect(() => {
     if (!deleteMenu) return;
@@ -132,6 +191,8 @@ export function App() {
   function applySettings(next: StudioSettings) {
     saveStudioSettings(next);
     setSettings(next);
+    setShapeFolder(next.shapeFolder);
+    setAlsoUseSquares(next.alsoUseSquares);
     const buttons = sizeButtonList(next.generatorSizes);
     setGenSizes((current) => {
       const kept = current.filter((size) => buttons.includes(size));
@@ -167,30 +228,45 @@ export function App() {
     setEditing(false);
     setDraft(null);
     setSelectedIds([]);
-    setDemoPlaying(false);
+    setEditTool('select');
     setPlayNonce((n) => n + 1);
-  }
-
-  function stopDemo() {
-    setDemoPlaying(false);
-    setDemoToken(0);
-    setPlayNonce((n) => n + 1);
-  }
-
-  function startDemo() {
-    if (!level || editing) return;
-    setDemoPlaying(true);
-    setDemoToken((n) => n + 1);
   }
 
   async function refresh(select?: number | null) {
     const [nextStatus, nextRows] = await Promise.all([window.px.status(), window.px.list()]);
     setStatus(nextStatus);
     setRows(nextRows);
-    setGenFrom(String(nextStatus.nextLevel));
-    const pick = select ?? selected ?? nextRows[0]?.levelNumber ?? null;
+    setGenFrom(String(studioMode === 'endless' ? nextStatus.nextEndless : nextStatus.nextLevel));
+    const modeRows = nextRows.filter((row) =>
+      studioMode === 'endless' ? isEndlessKey(row.levelNumber) : !isEndlessKey(row.levelNumber),
+    );
+    const pick =
+      select ??
+      (selected != null && modeRows.some((row) => row.levelNumber === selected)
+        ? selected
+        : modeRows[0]?.levelNumber ?? null);
     setSelected(pick);
     leaveEdit();
+    if (pick != null) setLevel(await window.px.getLevel(pick));
+    else setLevel(null);
+  }
+
+  async function switchStudioMode(mode: StudioMode) {
+    if (mode === studioMode) return;
+    if (!confirmLeaveEdit()) return;
+    leaveEdit();
+    setStudioMode(mode);
+    setQuery('');
+    setPanel('none');
+    const [nextStatus, nextRows] = await Promise.all([window.px.status(), window.px.list()]);
+    setStatus(nextStatus);
+    setRows(nextRows);
+    setGenFrom(String(mode === 'endless' ? nextStatus.nextEndless : nextStatus.nextLevel));
+    const modeRows = nextRows.filter((row) =>
+      mode === 'endless' ? isEndlessKey(row.levelNumber) : !isEndlessKey(row.levelNumber),
+    );
+    const pick = modeRows[0]?.levelNumber ?? null;
+    setSelected(pick);
     if (pick != null) setLevel(await window.px.getLevel(pick));
     else setLevel(null);
   }
@@ -207,11 +283,20 @@ export function App() {
   }, []);
 
   const visible = useMemo(() => {
-    const needle = query.trim();
-    if (!needle) return rows;
-    return rows.filter((row) => String(row.levelNumber).includes(needle) || (row.difficulty ?? '').includes(needle));
-  }, [rows, query]);
+    const modeRows = rows.filter((row) =>
+      studioMode === 'endless' ? isEndlessKey(row.levelNumber) : !isEndlessKey(row.levelNumber),
+    );
+    const needle = query.trim().toLowerCase();
+    if (!needle) return modeRows;
+    return modeRows.filter(
+      (row) =>
+        levelLabel(row.levelNumber).toLowerCase().includes(needle) ||
+        String(row.levelNumber).includes(needle) ||
+        (row.difficulty ?? '').toLowerCase().includes(needle),
+    );
+  }, [rows, query, studioMode]);
   const selectedIdSet = useMemo(() => new Set(selectedIds), [selectedIds]);
+  const generating = busy === 'Generating…' || busy === 'Regenerating…' || busy === 'Refreshing endless…';
 
   function popupError(message: string) {
     setError(message);
@@ -284,7 +369,10 @@ export function App() {
     setProgress({
       current: 0,
       total: count,
-      levelNumber: Number.isFinite(from) ? from : 5,
+      levelNumber:
+        studioMode === 'endless'
+          ? -(Number.isFinite(from) ? from : 1)
+          : Number.isFinite(from) ? from : 5,
       arrows: 0,
       fill: 0,
       openings: 0,
@@ -298,12 +386,13 @@ export function App() {
         replace: genReplace,
         storedSizes: genSizes,
         shapeFolder: shapeFolder || undefined,
-        alsoUseSquares: shapeFolder ? alsoUseSquares : undefined,
+        alsoUseSquares,
+        endless: studioMode === 'endless',
       });
       const first = result.generated[0] ?? result.skipped[0] ?? null;
       await refresh(first);
-      setPanel('none');
-      const skipped = result.skipped.length ? `, skipped ${result.skipped.length}` : '';
+      const skipped =
+        result.skipped.length > 0 ? ` Skipped ${result.skipped.length} existing.` : '';
       if (result.cancelled) {
         setNotice(
           `Stopped${result.cancelled === 'after' ? ' after this puzzle' : ''}. Wrote ${result.generated.length} level(s)${skipped}.`,
@@ -311,6 +400,7 @@ export function App() {
       } else {
         setNotice(`Wrote ${result.generated.length} level(s)${skipped}.`);
       }
+      setPanel('none');
     });
   }
 
@@ -348,11 +438,11 @@ export function App() {
 
   async function loadShapeFile(file: File) {
     try {
-      const [raster, buffer] = await Promise.all([rasterFromFile(file), file.arrayBuffer()]);
-      setShapeRaster(raster);
-      setShapeFileName(file.name);
-      setShapeFileBytes([...new Uint8Array(buffer)]);
-      applyBoardSize(singleSize, raster);
+      const loaded = await rasterFromFile(file);
+      setShapeRaster(loaded.raster);
+      setShapeFileName(loaded.fileName);
+      setShapeFileBytes(loaded.bytes);
+      applyBoardSize(singleSize, loaded.raster);
     } catch (error) {
       setShapeRaster(null);
       setShapeMatrix(null);
@@ -379,7 +469,7 @@ export function App() {
     }
     setShapeMatrix(matrix);
 
-    const attempts = singleQuality === 'fast' ? 8 : singleQuality === 'quality' ? 48 : 24;
+    const attempts = singleQuality === 'fast' ? 1 : singleQuality === 'quality' ? 16 : 4;
     setProgress({
       current: 0,
       total: attempts,
@@ -452,6 +542,7 @@ export function App() {
     setDeleteMenu(false);
     setDraft(cloneLevel(level));
     setSelectedIds([]);
+    setEditTool('select');
     setEditing(true);
     setPanel('none');
   }
@@ -511,12 +602,14 @@ export function App() {
     });
   }
 
-  async function onUpload(kind: 'selected' | 'pending') {
+  async function onUpload(kind: 'selected' | 'pending' | 'endlessPending') {
     await run('Uploading…', async () => {
       const result =
         kind === 'pending'
           ? await window.px.uploadPending()
-          : await window.px.uploadSelected(selected == null ? [] : [selected]);
+          : kind === 'endlessPending'
+            ? await window.px.uploadEndlessPending()
+            : await window.px.uploadSelected(selected == null ? [] : [selected]);
       if (result.error) throw new Error(result.error);
       await refresh(selected);
       setNotice(`Uploaded ${result.uploaded} level(s).`);
@@ -579,20 +672,73 @@ export function App() {
     });
   }
 
-  const generating = busy === 'Generating…' || busy === 'Regenerating…';
   const generatePercent = progress && progress.total > 0
     ? Math.min(100, Math.round((progress.current / progress.total) * 100))
     : 0;
-  const cloudLabel = !status
-    ? '…'
-    : status.supabase.tableReady
-      ? 'online'
-      : status.supabase.configured
-        ? 'keys saved'
-        : 'offline';
   const board = editing && draft ? draft : level;
   const separateEnabled = !!draft && canSeparate(draft, selectedIdSet);
   const mergeEnabled = !!draft && canMerge(draft, selectedIdSet);
+
+  async function onRefreshEndless() {
+    const count = status?.endlessStored ?? 0;
+    const starter = count === 0;
+    if (shapeFolder && shapeFolderCount === 0 && !alsoUseSquares) {
+      popupError('That folder has no images. Add PNG/JPG files, or tick “also use squares”.');
+      return;
+    }
+    if (genSizes.length === 0) {
+      popupError('Select at least one size in Generate more (same settings as Refresh all).');
+      return;
+    }
+    if (
+      !window.confirm(
+        starter
+          ? `No endless boards yet. Generate a starter pack of 25 using ${genSizes.join('/')} sizes${shapeFolder ? ' and the selected shape folder' : ''}?`
+          : `Regenerate all ${count} endless board(s) with fresh layouts using ${genSizes.join('/')} sizes${shapeFolder ? ' and the selected shape folder' : ''}?`,
+      )
+    ) {
+      return;
+    }
+    setPanel('refresh');
+    setProgress({
+      current: 0,
+      total: Math.max(1, count || 25),
+      levelNumber: -1,
+      arrows: 0,
+      fill: 0,
+      openings: 0,
+      difficulty: 'hard',
+    });
+    await run('Refreshing endless…', async () => {
+      // Re-list the folder so Refresh matches Generate even if files changed.
+      let folder = shapeFolder || undefined;
+      let squares = alsoUseSquares;
+      if (folder) {
+        const info = await window.px.listFolder(folder);
+        setShapeFolderCount(info.count);
+        if (info.count === 0 && !squares) {
+          throw new Error('That folder has no images. Add PNG/JPG files, or tick “also use squares”.');
+        }
+        folder = info.path || folder;
+      }
+      const result = await window.px.refreshEndless({
+        quality: endlessQuality,
+        starterCount: 25,
+        storedSizes: genSizes,
+        shapeFolder: folder,
+        alsoUseSquares: squares,
+      });
+      await refresh(result.generated[0] ?? null);
+      setNotice(
+        result.cancelled
+          ? `Stopped${result.cancelled === 'after' ? ' after this puzzle' : ''}. Refreshed ${result.generated.length} endless board(s).`
+          : starter
+            ? `Created ${result.generated.length} endless board(s).`
+            : `Refreshed ${result.generated.length} endless board(s).`,
+      );
+      setPanel('none');
+    });
+  }
 
   return (
     <>
@@ -600,47 +746,128 @@ export function App() {
       <header className="top">
         <div>
           <h1>PX</h1>
-          <p>Campaign studio</p>
+          <p>{studioMode === 'endless' ? 'Endless studio' : 'Campaign studio'}</p>
         </div>
-        <div className={`cloud-pill ${status?.supabase.tableReady ? 'ready' : ''}`}>{cloudLabel}</div>
+        <div className="top-actions">
+          <div className="mode-toggle" role="group" aria-label="Studio mode">
+            <button
+              type="button"
+              className={studioMode === 'campaign' ? 'active' : undefined}
+              onClick={() => void switchStudioMode('campaign')}
+              disabled={!!busy}
+            >
+              Campaign
+            </button>
+            <button
+              type="button"
+              className={studioMode === 'endless' ? 'active' : undefined}
+              onClick={() => void switchStudioMode('endless')}
+              disabled={!!busy}
+            >
+              Endless
+            </button>
+          </div>
+          <button
+            type="button"
+            className="icon-button"
+            onClick={() => openSettings('general')}
+            title="Settings"
+            aria-label="Settings"
+            disabled={!!busy}
+          >
+            <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true">
+              <path
+                fill="currentColor"
+                d="M19.14 12.94c.04-.31.06-.63.06-.94s-.02-.63-.06-.94l2.03-1.58a.5.5 0 0 0 .12-.64l-1.92-3.32a.5.5 0 0 0-.6-.22l-2.39.96a7.07 7.07 0 0 0-1.63-.94l-.36-2.54A.5.5 0 0 0 13.9 2h-3.8a.5.5 0 0 0-.49.42l-.36 2.54c-.58.23-1.12.54-1.63.94l-2.39-.96a.5.5 0 0 0-.6.22L2.71 8.48a.5.5 0 0 0 .12.64l2.03 1.58c-.04.31-.06.63-.06.94s.02.63.06.94L2.83 14.52a.5.5 0 0 0-.12.64l1.92 3.32c.14.24.43.34.68.22l2.39-.96c.5.4 1.05.71 1.63.94l.36 2.54c.05.24.25.42.49.42h3.8c.24 0 .44-.18.49-.42l.36-2.54c.58-.23 1.12-.54 1.63-.94l2.39.96c.25.12.54.02.68-.22l1.92-3.32a.5.5 0 0 0-.12-.64l-2.03-1.58ZM12 15.5A3.5 3.5 0 1 1 12 8.5a3.5 3.5 0 0 1 0 7Z"
+              />
+            </svg>
+          </button>
+        </div>
       </header>
 
       <aside className="side">
         <div className="side-actions">
-          <button className="primary" onClick={() => setPanel('generate')} disabled={!!busy}>
-            Generate multiple
-          </button>
-          <button
-            onClick={() => {
-              const n = selected ?? status?.nextLevel ?? 5;
-              setSingleLevel(String(n));
-              applyBoardSize(defaultBoardSize(n));
-              setPanel('single');
-            }}
-            disabled={!!busy}
-          >
-            Generate single
-          </button>
-          <button
-            onClick={() => {
-              setRegenSpec(selected != null ? String(selected) : '2-5');
-              setPanel('regenerate');
-            }}
-            disabled={!!busy}
-          >
-            Regenerate
-          </button>
-          <button onClick={() => void onUpload('pending')} disabled={!!busy || !status?.pending}>
-            Upload pending
-          </button>
-          <button onClick={() => void onPull()} disabled={!!busy}>
-            Pull from cloud
-          </button>
-          <button onClick={() => openSettings('supabase')}>Settings</button>
+          {studioMode === 'endless' ? (
+            <>
+              <button
+                className="primary refresh-endless"
+                onClick={() => void onRefreshEndless()}
+                disabled={!!busy}
+              >
+                Refresh all
+              </button>
+              <label className="quality-inline">
+                Quality
+                <select
+                  value={endlessQuality}
+                  onChange={(event) =>
+                    setEndlessQuality(event.target.value as typeof endlessQuality)
+                  }
+                  disabled={!!busy}
+                >
+                  <option value="fast">Fast</option>
+                  <option value="normal">Normal</option>
+                  <option value="quality">Quality</option>
+                </select>
+              </label>
+              <button className="primary" onClick={() => setPanel('generate')} disabled={!!busy}>
+                Generate more
+              </button>
+              <button
+                onClick={() => void onUpload('endlessPending')}
+                disabled={!!busy || !status?.pendingEndless}
+              >
+                Upload pending
+              </button>
+              <p className="gen-settings-hint">
+                Refresh / Generate use{' '}
+                {genSizes.length > 0 ? genSizes.map((n) => `${n}×${n}`).join(', ') : 'no sizes'}
+                {shapeFolder
+                  ? ` · ${shapeFolderCount} shape${shapeFolderCount === 1 ? '' : 's'}${alsoUseSquares ? ' + squares' : ''}`
+                  : ' · squares only'}
+                .{' '}
+                <button type="button" className="linkish" onClick={() => setPanel('generate')} disabled={!!busy}>
+                  Edit
+                </button>
+              </p>
+            </>
+          ) : (
+            <>
+              <button className="primary" onClick={() => setPanel('generate')} disabled={!!busy}>
+                Generate multiple
+              </button>
+              <button
+                onClick={() => {
+                  const n = selected ?? status?.nextLevel ?? 5;
+                  setSingleLevel(String(n));
+                  applyBoardSize(defaultBoardSize(n));
+                  setPanel('single');
+                }}
+                disabled={!!busy}
+              >
+                Generate single
+              </button>
+              <button
+                onClick={() => {
+                  setRegenSpec(selected != null ? String(selected) : '2-5');
+                  setPanel('regenerate');
+                }}
+                disabled={!!busy}
+              >
+                Regenerate
+              </button>
+              <button onClick={() => void onUpload('pending')} disabled={!!busy || !status?.pending}>
+                Upload pending
+              </button>
+              <button onClick={() => void onPull()} disabled={!!busy}>
+                Pull from cloud
+              </button>
+            </>
+          )}
         </div>
         <input
           className="search"
-          placeholder="Filter levels"
+          placeholder={studioMode === 'endless' ? 'Filter S-levels' : 'Filter levels'}
           value={query}
           onChange={(event) => setQuery(event.target.value)}
         />
@@ -657,7 +884,7 @@ export function App() {
               }}
             >
               <span className="num">
-                {row.levelNumber}
+                {levelLabel(row.levelNumber)}
                 {row.shaped ? (
                   <span className="shape-mark" title="Generated from an image">
                     <svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true">
@@ -671,10 +898,19 @@ export function App() {
               <span className="meta">
                 {row.difficulty ?? '—'} · {row.arrowCount} · {row.gridSize}×{row.gridSize}
               </span>
-              <span className={`dot ${row.uploadedAt ? 'up' : ''}`} title={row.uploadedAt ? 'On Supabase' : 'Local only'} />
+              <span
+                className={`dot ${row.uploadedAt ? 'up' : ''}`}
+                title={row.uploadedAt ? 'On Supabase' : 'Local only'}
+              />
             </button>
           ))}
-          {visible.length === 0 && <p className="empty">No levels yet.</p>}
+          {visible.length === 0 && (
+            <p className="empty">
+              {studioMode === 'endless'
+                ? 'No endless boards yet. Hit Refresh all to generate a starter pack.'
+                : 'No levels yet.'}
+            </p>
+          )}
         </div>
       </aside>
 
@@ -685,7 +921,7 @@ export function App() {
               <strong>No level selected</strong>
             ) : (
               <>
-                <strong>Level {selected}</strong>
+                <strong>{studioMode === 'endless' ? levelLabel(selected) : `Level ${selected}`}</strong>
                 <span>
                   {board ? `${board.arrows.length} arrows · ${board.grid.rows}×${board.grid.cols}` : ''}
                   {editing ? ' · editing' : ''}
@@ -694,13 +930,20 @@ export function App() {
             )}
           </div>
           <div className="main-actions">
-            <button
-              className={demoPlaying ? 'primary' : undefined}
-              onClick={() => (demoPlaying ? stopDemo() : startDemo())}
-              disabled={selected == null || !level || !!busy || editing}
-            >
-              {demoPlaying ? 'Stop' : 'Play'}
-            </button>
+            <label className="view-select" title="Arrow color diagnostic mode">
+              View
+              <select
+                value={viewMode}
+                onChange={(event) =>
+                  setViewMode(event.target.value as 'construction' | 'blocks' | 'solveOrder')
+                }
+                disabled={selected == null || !board}
+              >
+                <option value="construction">Construction</option>
+                <option value="blocks">Macro blocks</option>
+                <option value="solveOrder">Solve order</option>
+              </select>
+            </label>
             <button
               className={showOpen ? 'primary' : undefined}
               onClick={() => setShowOpen((on) => !on)}
@@ -711,16 +954,45 @@ export function App() {
               Open
             </button>
             <button
+              className={showStuck ? 'primary' : undefined}
+              onClick={() => setShowStuck((on) => !on)}
+              disabled={selected == null || !level || !!busy}
+              title="Highlight arrows stuck in an unsolvable deadlock (none on valid levels; useful while editing)"
+              aria-pressed={showStuck}
+            >
+              Stuck
+            </button>
+            <button
               className={editing ? 'primary' : undefined}
               onClick={toggleEdit}
-              disabled={selected == null || !level || !!busy || demoPlaying}
+              disabled={selected == null || !level || !!busy}
             >
               Edit
             </button>
+            {editing && (
+              <>
+                <button
+                  className={editTool === 'pencil' ? 'primary' : undefined}
+                  onClick={() => setEditTool((t) => (t === 'pencil' ? 'select' : 'pencil'))}
+                  title="Draw arrow: click head, then corners; click last node again to finish. Click a tail tip to extend."
+                  aria-pressed={editTool === 'pencil'}
+                >
+                  Pencil
+                </button>
+                <button
+                  className={editTool === 'eraser' ? 'primary' : undefined}
+                  onClick={() => setEditTool((t) => (t === 'eraser' ? 'select' : 'eraser'))}
+                  title="Erase: click cells along a path; click last node again to cut"
+                  aria-pressed={editTool === 'eraser'}
+                >
+                  Eraser
+                </button>
+              </>
+            )}
             <button
               className="icon-btn"
               onClick={() => void onUpload('selected')}
-              disabled={selected == null || !!busy || editing || demoPlaying}
+              disabled={selected == null || !!busy || editing}
               title="Upload this level"
               aria-label="Upload this level"
             >
@@ -730,7 +1002,7 @@ export function App() {
               <button
                 className="icon-btn"
                 onClick={() => setDeleteMenu((open) => !open)}
-                disabled={selected == null || !!busy || editing || demoPlaying}
+                disabled={selected == null || !!busy || editing}
                 title="Delete"
                 aria-label="Delete"
                 aria-haspopup="menu"
@@ -774,24 +1046,58 @@ export function App() {
           </div>
         </div>
         <Playfield
-          key={`${selected ?? 'none'}-${editing ? 'edit' : 'play'}-${playNonce}`}
+          key={`${selected ?? 'none'}-${editing ? 'edit' : 'view'}-${playNonce}`}
           level={board}
-          keysEnabled={panel === 'none' && !editing && !demoPlaying}
+          keysEnabled={panel === 'none' && !editing}
           editMode={editing}
+          editTool={editing ? editTool : 'select'}
           selectedIds={selectedIdSet}
           onSelect={setSelectedIds}
-          demoToken={demoToken}
-          onDemoFinished={() => setDemoPlaying(false)}
+          onDraftChange={(next, ids) => applyDraft(next, ids)}
           highlightOpen={showOpen && !editing}
+          highlightStuck={showStuck}
+          viewMode={viewMode}
         />
       </main>
       {editing && (
         <aside className="edit-dock">
           <h2>Edit</h2>
+          <div className="edit-tools">
+            <button
+              type="button"
+              className={editTool === 'select' ? 'primary' : undefined}
+              onClick={() => setEditTool('select')}
+              aria-pressed={editTool === 'select'}
+            >
+              Select
+            </button>
+            <button
+              type="button"
+              className={editTool === 'pencil' ? 'primary' : undefined}
+              onClick={() => setEditTool('pencil')}
+              aria-pressed={editTool === 'pencil'}
+              title="Click head, then corners; click last node again to finish. Tail tip extends."
+            >
+              Pencil
+            </button>
+            <button
+              type="button"
+              className={editTool === 'eraser' ? 'primary' : undefined}
+              onClick={() => setEditTool('eraser')}
+              aria-pressed={editTool === 'eraser'}
+              title="Click along a path; click last node again to erase"
+            >
+              Eraser
+            </button>
+          </div>
           <p>
-            {selectedIds.length === 0
-              ? 'Click an arrow, or drag a box around several.'
-              : `${selectedIds.length} selected`}
+            {editTool === 'pencil'
+              ? 'Head, then corners. Click the last node again to place. Click a tail tip to extend. Esc cancels.'
+              : editTool === 'eraser'
+                ? 'Click cells to cut. Click the last node again to erase. Remnant tails get a new head.'
+                : selectedIds.length === 0
+                  ? 'Click an arrow, or drag a box around several.'
+                  : `${selectedIds.length} selected`}
           </p>
           <button onClick={onEditDelete} disabled={selectedIds.length === 0}>
             Delete
@@ -812,11 +1118,17 @@ export function App() {
       )}
 
       <footer className="status">
-        <span>{status ? `${status.stored} stored · ${status.pending} pending upload` : 'Loading…'}</span>
+        <span>
+          {status
+            ? studioMode === 'endless'
+              ? `${status.endlessStored} endless · ${status.pendingEndless} pending upload · next ${formatNextEndless(status.nextEndless)}`
+              : `${status.stored} stored · ${status.pending} pending upload`
+            : 'Loading…'}
+        </span>
         <span>{busy || notice}</span>
         {progress && (
           <span>
-            {progress.current}/{progress.total} · level {progress.levelNumber} · {progress.arrows} arrows
+            {progress.current}/{progress.total} · {levelLabel(progress.levelNumber)} · {progress.arrows} arrows
           </span>
         )}
       </footer>
@@ -824,7 +1136,13 @@ export function App() {
       {panel === 'generate' && (
         <Modal onClose={() => { if (!generating) setPanel('none'); }}>
         <form className="sheet split" onSubmit={onGenerate}>
-          <h2>{generating ? 'Generating…' : 'Generate multiple'}</h2>
+          <h2>
+            {generating
+              ? 'Generating…'
+              : studioMode === 'endless'
+                ? 'Generate endless boards'
+                : 'Generate multiple'}
+          </h2>
           {!generating && error && <p className="form-error" role="alert">{error}</p>}
           {generating ? (
             <div className="gen-progress" aria-live="polite">
@@ -834,7 +1152,7 @@ export function App() {
                   <strong>{generatePercent}%</strong>
                   <span>
                     {progress && progress.current === 0
-                      ? `Starting level ${progress.levelNumber}`
+                      ? `Starting ${levelLabel(progress.levelNumber)}`
                       : progress
                         ? `Finished ${progress.current} of ${progress.total}`
                         : 'Working'}
@@ -846,7 +1164,7 @@ export function App() {
               </div>
               <p>
                 {progress?.arrows
-                  ? `Level ${progress.levelNumber} · ${progress.arrows} arrows`
+                  ? `${levelLabel(progress.levelNumber)} · ${progress.arrows} arrows`
                   : 'Hard boards can take a few seconds each. The window is still working.'}
                 {stopping === 'after'
                   ? ' Finishing this puzzle, then stopping.'
@@ -859,7 +1177,7 @@ export function App() {
             <div className="sheet-grid">
               <div className="sheet-col">
           <label>
-            From
+            {studioMode === 'endless' ? 'From S-index' : 'From'}
             <input
               autoFocus
               value={genFrom}
@@ -878,9 +1196,9 @@ export function App() {
           <label>
             Quality
             <select value={genQuality} onChange={(event) => setGenQuality(event.target.value as typeof genQuality)}>
-              <option value="fast">Fast (1 seed)</option>
-              <option value="normal">Normal (8 seeds)</option>
-              <option value="quality">Quality (32 seeds)</option>
+              <option value="fast">Fast (1 seed, more purple)</option>
+              <option value="normal">Normal (4 seeds)</option>
+              <option value="quality">Quality (16 seeds)</option>
             </select>
           </label>
           <div>
@@ -926,27 +1244,11 @@ export function App() {
             Overwrite if the number already exists
           </label>
           <div className="folder-row">
-            <button
-              type="button"
-              onClick={() => {
-                void window.px.pickFolder().then((picked) => {
-                  if (!picked) return;
-                  setShapeFolder(picked.path);
-                  setShapeFolderCount(picked.count);
-                });
-              }}
-            >
+            <button type="button" onClick={() => void pickShapeFolder()}>
               Add folder
             </button>
             {shapeFolder ? (
-              <button
-                type="button"
-                onClick={() => {
-                  setShapeFolder('');
-                  setShapeFolderCount(0);
-                  setAlsoUseSquares(false);
-                }}
-              >
+              <button type="button" onClick={clearShapeFolder}>
                 Clear
               </button>
             ) : null}
@@ -960,13 +1262,22 @@ export function App() {
                 <input
                   type="checkbox"
                   checked={alsoUseSquares}
-                  onChange={(event) => setAlsoUseSquares(event.target.checked)}
+                  onChange={(event) => {
+                    const next = event.target.checked;
+                    setAlsoUseSquares(next);
+                    persistShapeSettings({ alsoUseSquares: next });
+                  }}
                 />
                 Also use squares
               </label>
             </>
           ) : (
-            <p>Optional. Pick a folder of silhouettes so boards are not all squares.</p>
+            <p>
+              Optional. Pick a folder of silhouettes so boards are not all squares.
+              {studioMode === 'endless'
+                ? ' Saved for Generate more and Refresh all.'
+                : ''}
+            </p>
           )}
               </div>
             </div>
@@ -986,6 +1297,40 @@ export function App() {
             )}
           </div>
         </form>
+        </Modal>
+      )}
+      {panel === 'refresh' && (
+        <Modal onClose={() => { if (!generating) setPanel('none'); }}>
+          <div className="sheet">
+            <h2>Refreshing endless…</h2>
+            <div className="gen-progress" aria-live="polite">
+              <div className="gen-progress-head">
+                <div className="spinner" aria-hidden="true" />
+                <div>
+                  <strong>{generatePercent}%</strong>
+                  <span>
+                    {progress
+                      ? `${levelLabel(progress.levelNumber)} · ${progress.current}/${progress.total}`
+                      : 'Working'}
+                  </span>
+                </div>
+              </div>
+              <div className={`progress-track ${progress && progress.current === 0 ? 'indeterminate' : ''}`}>
+                <div className="progress-fill" style={{ width: `${generatePercent}%` }} />
+              </div>
+              <p>
+                {progress?.arrows
+                  ? `${levelLabel(progress.levelNumber)} · ${progress.arrows} arrows`
+                  : 'Rebuilding every endless board with a fresh seed.'}
+                {stopping === 'after'
+                  ? ' Finishing this puzzle, then stopping.'
+                  : stopping === 'now'
+                    ? ' Stopping as soon as possible…'
+                    : ''}
+              </p>
+            </div>
+            <div className="sheet-actions">{generationStopActions()}</div>
+          </div>
         </Modal>
       )}
       {panel === 'single' && (

@@ -39,6 +39,10 @@ export interface ArrowDefinition {
   /** Ordered path; final element is the tappable head. */
   cells: GridCell[];
   direction: Direction;
+  /** Macro-block id used by clustered reverse generation. */
+  blockId?: number;
+  /** 1-based click order for diagnostics (1 = first click, N = final click). */
+  solveIndex?: number;
   /**
    * How the generator placed this piece. Omitted on the reverse-built core.
    * `filler` — pocket / hole packing that still follows solve-order rules.

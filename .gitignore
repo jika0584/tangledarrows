@@ -49,3 +49,6 @@ tools/px/data/
 px.exe
 tools/px-ui/dist/
 tools/px-ui/dist-electron/
+
+# Supabase CLI local link state
+supabase/.temp/

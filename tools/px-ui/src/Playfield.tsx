@@ -1,8 +1,10 @@
 import { useEffect, useRef } from 'react';
-import { Level, MAX_LIVES } from '../../../src/levels/types';
+import { GridCell, Level, MAX_LIVES } from '../../../src/levels/types';
 import { colors } from '../../../src/theme/theme';
 import {
   arrowsInRect,
+  cellAtBoard,
+  cellCenter,
   fitLayout,
   hitArrow,
   isBlockerCell,
@@ -11,8 +13,18 @@ import {
   travelPath,
   type Layout,
 } from './boardMath';
-import { shortestSolution } from '../../../src/game/engine/Solution';
-import { escapableArrowIds } from '../../../src/game/engine/WinCondition';
+import {
+  arrowByTailCell,
+  canAddAnchor,
+  cellsFromPencilAnchors,
+  commitEraserStroke,
+  commitPencilExtend,
+  commitPencilStroke,
+  expandAnchors,
+  pencilStrokeReady,
+  type EditTool,
+} from './editArrows';
+import { escapableArrowIds, neverEscapableArrowIds } from '../../../src/game/engine/WinCondition';
 import { easeInQuad, RECOIL_BACK_MS, slideDurationMs } from '../../../src/game/rendering/slideTiming';
 import { PlayAnimation, usePlay } from './usePlay';
 
@@ -28,12 +40,15 @@ interface PlayfieldProps {
   /** When false, +/- / R stay out of the way of dialogs and form fields. */
   keysEnabled?: boolean;
   editMode?: boolean;
+  editTool?: EditTool;
   selectedIds?: ReadonlySet<string>;
   onSelect?: (ids: string[]) => void;
-  demoToken?: number;
-  onDemoFinished?: () => void;
+  onDraftChange?: (level: Level, selectedIds: string[]) => void;
   /** Glow arrows that can slide off the board in the current position. */
   highlightOpen?: boolean;
+  /** Glow arrows that can never clear (unsolvable deadlock). */
+  highlightStuck?: boolean;
+  viewMode?: 'construction' | 'blocks' | 'solveOrder';
 }
 
 interface Camera {
@@ -61,11 +76,13 @@ export function Playfield({
   level,
   keysEnabled = true,
   editMode = false,
+  editTool = 'select',
   selectedIds,
   onSelect,
-  demoToken = 0,
-  onDemoFinished,
+  onDraftChange,
   highlightOpen = false,
+  highlightStuck = false,
+  viewMode = 'construction',
 }: PlayfieldProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const wrapRef = useRef<HTMLDivElement>(null);
@@ -85,52 +102,46 @@ export function Playfield({
     panY: number;
     moved: boolean;
     shift: boolean;
+    stroke?: boolean;
   } | null>(null);
   const marquee = useRef<Marquee | null>(null);
+  const strokeAnchors = useRef<GridCell[]>([]);
+  /** When set, pencil is lengthening this arrow from its tail tip. */
+  const extendingArrowId = useRef<string | null>(null);
+  const hoverCell = useRef<GridCell | null>(null);
   const size = useRef({ width: 1, height: 1 });
   const keysEnabledRef = useRef(keysEnabled);
   keysEnabledRef.current = keysEnabled;
   const editModeRef = useRef(editMode);
   editModeRef.current = editMode;
+  const editToolRef = useRef(editTool);
+  editToolRef.current = editTool;
   const highlightOpenRef = useRef(highlightOpen);
   highlightOpenRef.current = highlightOpen;
+  const highlightStuckRef = useRef(highlightStuck);
+  highlightStuckRef.current = highlightStuck;
   const selectedIdsRef = useRef(selectedIds);
   selectedIdsRef.current = selectedIds;
   const onSelectRef = useRef(onSelect);
   onSelectRef.current = onSelect;
-  const onDemoFinishedRef = useRef(onDemoFinished);
-  onDemoFinishedRef.current = onDemoFinished;
-  const wasPlayingDemo = useRef(false);
+  const onDraftChangeRef = useRef(onDraftChange);
+  onDraftChangeRef.current = onDraftChange;
+  const viewModeRef = useRef(viewMode);
+  viewModeRef.current = viewMode;
 
   useEffect(() => {
     camera.current = { zoom: 1, panX: 0, panY: 0 };
     clocks.current.clear();
+    strokeAnchors.current = [];
+    extendingArrowId.current = null;
+    hoverCell.current = null;
   }, [level?.id]);
 
   useEffect(() => {
-    if (!demoToken || editMode || !level) return;
-    const order = shortestSolution(level);
-    if (!order || order.length === 0) {
-      onDemoFinishedRef.current?.();
-      return;
-    }
-    wasPlayingDemo.current = true;
-    playRef.current.playSolution(order);
-  }, [demoToken, editMode, level]);
-
-  useEffect(() => {
-    if (wasPlayingDemo.current && !play.playingDemo) {
-      wasPlayingDemo.current = false;
-      onDemoFinishedRef.current?.();
-    }
-  }, [play.playingDemo]);
-
-  useEffect(() => {
-    if (editMode) {
-      playRef.current.stopSolution();
-      wasPlayingDemo.current = false;
-    }
-  }, [editMode]);
+    strokeAnchors.current = [];
+    extendingArrowId.current = null;
+    hoverCell.current = null;
+  }, [editTool, editMode]);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -170,6 +181,90 @@ export function Playfield({
       cam.zoom = next;
     };
 
+    const pickCell = (sx: number, sy: number): GridCell | null => {
+      const levelNow = levelRef.current;
+      if (!levelNow) return null;
+      const board = screenToBoard(sx, sy);
+      return cellAtBoard(board.x, board.y, layoutRef.current, levelNow.grid);
+    };
+
+    const finishStroke = () => {
+      const levelNow = levelRef.current;
+      const anchors = strokeAnchors.current;
+      const extendId = extendingArrowId.current;
+      strokeAnchors.current = [];
+      extendingArrowId.current = null;
+      hoverCell.current = null;
+      if (!levelNow || anchors.length === 0) return;
+      const tool = editToolRef.current;
+      const result =
+        tool === 'eraser'
+          ? commitEraserStroke(levelNow, anchors)
+          : extendId
+            ? commitPencilExtend(levelNow, extendId, anchors)
+            : commitPencilStroke(levelNow, anchors);
+      if (result.error) {
+        window.alert(result.error);
+        return;
+      }
+      onDraftChangeRef.current?.(result.level, result.selectedIds);
+    };
+
+    const addStrokePoint = (cell: GridCell) => {
+      const levelNow = levelRef.current;
+      if (!levelNow) return;
+      if (!isFloorCell(levelNow.grid, cell.row, cell.col)) return;
+
+      const anchors = strokeAnchors.current;
+      const last = anchors[anchors.length - 1];
+      // Same node twice in a row finalizes (replaces fragile double-click).
+      if (last && last.row === cell.row && last.col === cell.col) {
+        if (editToolRef.current === 'pencil') {
+          if (pencilStrokeReady(anchors, extendingArrowId.current)) finishStroke();
+        } else if (anchors.length >= 1) {
+          finishStroke();
+        }
+        return;
+      }
+
+      if (anchors.length === 0 && editToolRef.current === 'pencil') {
+        const atTail = arrowByTailCell(levelNow, cell);
+        if (atTail) {
+          extendingArrowId.current = atTail.id;
+          strokeAnchors.current = [{ ...cell }];
+          return;
+        }
+        // New arrow must start on an empty floor cell (first click = head).
+        const occupied = levelNow.arrows.some((arrow) =>
+          arrow.cells.some((c) => c.row === cell.row && c.col === cell.col),
+        );
+        if (occupied) return;
+      }
+
+      if (!canAddAnchor(anchors, cell)) return;
+
+      if (editToolRef.current === 'pencil' && extendingArrowId.current) {
+        const arrow = levelNow.arrows.find((a) => a.id === extendingArrowId.current);
+        const body = arrow?.cells[1];
+        if (
+          anchors.length === 1 &&
+          body &&
+          body.row === cell.row &&
+          body.col === cell.col
+        ) {
+          return;
+        }
+        const trial = [...anchors, cell];
+        if (trial.length >= 2 && !expandAnchors(trial)) return;
+      } else if (editToolRef.current === 'pencil') {
+        const trial = [...anchors, cell];
+        const cells = cellsFromPencilAnchors(trial);
+        if (trial.length >= 2 && !cells) return;
+      }
+
+      strokeAnchors.current = [...anchors, cell];
+    };
+
     const draw = (now: number) => {
       paintCanvas(canvas, now, {
         level: levelRef.current,
@@ -179,9 +274,15 @@ export function Playfield({
         clocks: clocks.current,
         size: size.current,
         editMode: editModeRef.current,
+        editTool: editToolRef.current,
         highlightOpen: highlightOpenRef.current,
+        highlightStuck: highlightStuckRef.current,
         selectedIds: selectedIdsRef.current,
         marquee: marquee.current,
+        strokeAnchors: strokeAnchors.current,
+        extendingArrowId: extendingArrowId.current,
+        hoverCell: hoverCell.current,
+        viewMode: viewModeRef.current,
       });
       raf = requestAnimationFrame(draw);
     };
@@ -196,17 +297,24 @@ export function Playfield({
       canvas.focus();
       canvas.setPointerCapture(event.pointerId);
       const rect = canvas.getBoundingClientRect();
-      const pan = !editModeRef.current || event.button !== 0;
+      const drawing =
+        editModeRef.current &&
+        (editToolRef.current === 'pencil' || editToolRef.current === 'eraser');
+      const strokeClick = drawing && event.button === 0;
+      const selectClick =
+        editModeRef.current && editToolRef.current === 'select' && event.button === 0;
+
       drag.current = {
-        kind: pan ? 'pan' : 'marquee',
+        kind: selectClick ? 'marquee' : 'pan',
         x: event.clientX - rect.left,
         y: event.clientY - rect.top,
         panX: camera.current.panX,
         panY: camera.current.panY,
         moved: false,
         shift: event.shiftKey,
+        stroke: strokeClick,
       };
-      if (!pan) {
+      if (selectClick) {
         marquee.current = {
           x0: drag.current.x,
           y0: drag.current.y,
@@ -216,14 +324,22 @@ export function Playfield({
       }
     };
     const onPointerMove = (event: PointerEvent) => {
-      if (!drag.current) return;
       const rect = canvas.getBoundingClientRect();
       const x = event.clientX - rect.left;
       const y = event.clientY - rect.top;
+      if (
+        editModeRef.current &&
+        (editToolRef.current === 'pencil' || editToolRef.current === 'eraser')
+      ) {
+        hoverCell.current = pickCell(x, y);
+      } else {
+        hoverCell.current = null;
+      }
+      if (!drag.current) return;
       const dx = x - drag.current.x;
       const dy = y - drag.current.y;
       if (Math.hypot(dx, dy) > 4) drag.current.moved = true;
-      if (drag.current.kind === 'pan' && drag.current.moved) {
+      if (drag.current.kind === 'pan' && drag.current.moved && !drag.current.stroke) {
         camera.current.panX = drag.current.panX + dx;
         camera.current.panY = drag.current.panY + dy;
       } else if (drag.current.kind === 'marquee') {
@@ -239,7 +355,13 @@ export function Playfield({
       marquee.current = null;
       if (!session) return;
 
-      if (editModeRef.current && session.kind === 'marquee') {
+      if (session.stroke && !session.moved && event.button === 0) {
+        const cell = pickCell(x, y);
+        if (cell) addStrokePoint(cell);
+        return;
+      }
+
+      if (editModeRef.current && session.kind === 'marquee' && editToolRef.current === 'select') {
         const board = screenToBoard(x, y);
         const start = screenToBoard(session.x, session.y);
         const arrows = levelRef.current?.arrows ?? [];
@@ -269,7 +391,16 @@ export function Playfield({
       }
 
       const { state, tapArrow } = playRef.current;
-      if (session.kind !== 'pan' || session.moved || !state || state.status !== 'playing') return;
+      if (
+        editModeRef.current ||
+        session.kind !== 'pan' ||
+        session.moved ||
+        session.stroke ||
+        !state ||
+        state.status !== 'playing'
+      ) {
+        return;
+      }
       const board = screenToBoard(x, y);
       const hit = hitArrow(board.x, board.y, state.arrows, layoutRef.current);
       if (hit) tapArrow(hit.id);
@@ -283,10 +414,20 @@ export function Playfield({
     };
     const onKey = (event: KeyboardEvent) => {
       const active = document.activeElement;
-      if (active instanceof HTMLInputElement || active instanceof HTMLTextAreaElement || active instanceof HTMLSelectElement) {
+      if (
+        active instanceof HTMLInputElement ||
+        active instanceof HTMLTextAreaElement ||
+        active instanceof HTMLSelectElement
+      ) {
         return;
       }
       if (document.querySelector('.modal')) return;
+      if (event.key === 'Escape' && editModeRef.current) {
+        strokeAnchors.current = [];
+        extendingArrowId.current = null;
+        hoverCell.current = null;
+        return;
+      }
       if (event.key === '+' || event.key === '=') {
         event.preventDefault();
         zoomAt(size.current.width / 2, size.current.height / 2, 1.18);
@@ -344,9 +485,15 @@ function paintCanvas(
     clocks: Map<string, AnimClock>;
     size: { width: number; height: number };
     editMode: boolean;
+    editTool: EditTool;
     highlightOpen: boolean;
+    highlightStuck: boolean;
     selectedIds?: ReadonlySet<string>;
     marquee: Marquee | null;
+    strokeAnchors: GridCell[];
+    extendingArrowId: string | null;
+    hoverCell: GridCell | null;
+    viewMode: 'construction' | 'blocks' | 'solveOrder';
   },
 ) {
   const ctx = canvas.getContext('2d');
@@ -376,10 +523,53 @@ function paintCanvas(
 
   drawBoard(ctx, level, args.layoutRef.current);
 
+  const openIds = args.highlightOpen
+    ? new Set(
+        escapableArrowIds({
+          level,
+          arrows: level.arrows,
+          lives: MAX_LIVES,
+          moves: 0,
+          status: 'playing',
+        }),
+      )
+    : null;
+  const stuckIds = args.highlightStuck ? new Set(neverEscapableArrowIds(level)) : null;
+
+  const arrowHighlight = (id: string): { open: boolean; stuck: boolean; dimmed: boolean } => {
+    const open = openIds?.has(id) ?? false;
+    const stuck = stuckIds?.has(id) ?? false;
+    const dimmed = Boolean((openIds && !open) || (stuckIds && !stuck));
+    return { open, stuck, dimmed };
+  };
+
   if (args.editMode) {
     for (const arrow of level.arrows) {
-      drawArrow(ctx, arrow, level.grid, args.layoutRef.current, undefined, now, false, args.selectedIds?.has(arrow.id) ?? false);
+      const hi = arrowHighlight(arrow.id);
+      drawArrow(
+        ctx,
+        arrow,
+        level,
+        args.layoutRef.current,
+        undefined,
+        now,
+        false,
+        args.selectedIds?.has(arrow.id) ?? false,
+        hi.open,
+        hi.dimmed,
+        args.viewMode,
+        hi.stuck,
+      );
     }
+    drawStrokePreview(
+      ctx,
+      level,
+      args.layoutRef.current,
+      args.strokeAnchors,
+      args.hoverCell,
+      args.editTool,
+      args.extendingArrowId,
+    );
     ctx.restore();
     if (args.marquee) drawMarquee(ctx, args.marquee);
     drawHud(ctx, width, height, 0, 'playing', cam.zoom, true);
@@ -388,8 +578,15 @@ function paintCanvas(
 
   if (!play.state) return;
 
-  const openIds =
-    args.highlightOpen ? new Set(escapableArrowIds(play.state)) : null;
+  const playOpenIds = args.highlightOpen ? new Set(escapableArrowIds(play.state)) : null;
+  const playStuckIds = args.highlightStuck ? new Set(neverEscapableArrowIds(level)) : null;
+
+  const playHighlight = (id: string): { open: boolean; stuck: boolean; dimmed: boolean } => {
+    const open = playOpenIds?.has(id) ?? false;
+    const stuck = playStuckIds?.has(id) ?? false;
+    const dimmed = Boolean((playOpenIds && !open) || (playStuckIds && !stuck));
+    return { open, stuck, dimmed };
+  };
 
   const { animations, failed, onAnimationEnd } = play;
 
@@ -402,25 +599,26 @@ function paintCanvas(
       distance: anim.distance,
       started: now,
       duration:
-        anim.kind === 'recoil'
-          ? RECOIL_BACK_MS + 90
-          : slideDurationMs(anim.distance),
+        anim.kind === 'recoil' ? RECOIL_BACK_MS + 90 : slideDurationMs(anim.distance),
     });
   }
 
   const drawn = new Set<string>();
   for (const arrow of play.state.arrows) {
+    const hi = playHighlight(arrow.id);
     drawArrow(
       ctx,
       arrow,
-      level.grid,
+      level,
       args.layoutRef.current,
       args.clocks.get(arrow.id),
       now,
       failed.has(arrow.id),
       false,
-      openIds?.has(arrow.id) ?? false,
-      Boolean(openIds && !openIds.has(arrow.id)),
+      hi.open,
+      hi.dimmed,
+      args.viewMode,
+      hi.stuck,
     );
     drawn.add(arrow.id);
   }
@@ -429,7 +627,20 @@ function paintCanvas(
     if (drawn.has(id) || anim.kind !== 'escape') continue;
     const source = level.arrows.find((arrow) => arrow.id === id);
     if (!source) continue;
-    drawArrow(ctx, source, level.grid, args.layoutRef.current, args.clocks.get(id), now, false);
+    drawArrow(
+      ctx,
+      source,
+      level,
+      args.layoutRef.current,
+      args.clocks.get(id),
+      now,
+      false,
+      false,
+      false,
+      false,
+      args.viewMode,
+      false,
+    );
   }
 
   for (const [id, clock] of [...args.clocks.entries()]) {
@@ -441,6 +652,88 @@ function paintCanvas(
 
   ctx.restore();
   drawHud(ctx, width, height, play.state.lives, play.state.status, cam.zoom, false);
+}
+
+function drawStrokePreview(
+  ctx: CanvasRenderingContext2D,
+  level: Level,
+  layout: Layout,
+  anchors: GridCell[],
+  hover: GridCell | null,
+  tool: EditTool,
+  extendingArrowId: string | null,
+) {
+  if (tool !== 'pencil' && tool !== 'eraser') return;
+  const previewAnchors =
+    hover && canAddAnchor(anchors, hover) ? [...anchors, hover] : anchors;
+  if (previewAnchors.length === 0) return;
+
+  const extending = tool === 'pencil' && !!extendingArrowId;
+  const path = extending
+    ? expandAnchors(previewAnchors) ??
+      (previewAnchors.length === 1 ? [{ ...previewAnchors[0] }] : null)
+    : tool === 'pencil'
+      ? cellsFromPencilAnchors(previewAnchors) ??
+        (previewAnchors.length === 1 ? [{ ...previewAnchors[0] }] : null)
+      : expandAnchors(previewAnchors);
+  if (!path || path.length === 0) return;
+
+  const stroke = tool === 'eraser' ? colors.arrowBlocked : colors.arrowFiller;
+  ctx.save();
+  ctx.globalAlpha = 0.55;
+  ctx.strokeStyle = stroke;
+  ctx.fillStyle = stroke;
+  ctx.lineWidth = layout.cellSize * 0.42;
+  ctx.lineCap = 'round';
+  ctx.lineJoin = 'round';
+  if (path.length === 1) {
+    const c = cellCenter(path[0], layout);
+    ctx.beginPath();
+    ctx.arc(c.x, c.y, layout.cellSize * 0.28, 0, Math.PI * 2);
+    ctx.fill();
+  } else {
+    ctx.beginPath();
+    const first = cellCenter(path[0], layout);
+    ctx.moveTo(first.x, first.y);
+    for (let i = 1; i < path.length; i++) {
+      const p = cellCenter(path[i], layout);
+      ctx.lineTo(p.x, p.y);
+    }
+    ctx.stroke();
+    if (tool === 'pencil' && !extending) {
+      const tip = cellCenter(path[path.length - 1], layout);
+      const neck = cellCenter(path[path.length - 2], layout);
+      const angle = Math.atan2(tip.y - neck.y, tip.x - neck.x);
+      ctx.translate(tip.x, tip.y);
+      ctx.rotate(angle);
+      ctx.beginPath();
+      ctx.moveTo(layout.cellSize * HEAD_REACH, 0);
+      ctx.lineTo(-layout.cellSize * HEAD_BACK, layout.cellSize * HEAD_HALF);
+      ctx.lineTo(-layout.cellSize * HEAD_BACK, -layout.cellSize * HEAD_HALF);
+      ctx.closePath();
+      ctx.fill();
+    } else if (extending) {
+      const tip = cellCenter(path[path.length - 1], layout);
+      ctx.beginPath();
+      ctx.arc(tip.x, tip.y, layout.cellSize * 0.22, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+  ctx.restore();
+
+  // Dim illegal hover.
+  if (hover && anchors.length > 0 && !canAddAnchor(anchors, hover)) {
+    const c = cellCenter(hover, layout);
+    ctx.save();
+    ctx.globalAlpha = 0.35;
+    ctx.fillStyle = colors.arrowBlocked;
+    ctx.beginPath();
+    ctx.arc(c.x, c.y, layout.cellSize * 0.22, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+  }
+
+  void level;
 }
 
 function drawBoard(ctx: CanvasRenderingContext2D, level: Level, layout: Layout) {
@@ -470,7 +763,7 @@ function drawBoard(ctx: CanvasRenderingContext2D, level: Level, layout: Layout) 
 function drawArrow(
   ctx: CanvasRenderingContext2D,
   arrow: Level['arrows'][number],
-  grid: Level['grid'],
+  level: Level,
   layout: Layout,
   clock: AnimClock | undefined,
   now: number,
@@ -478,8 +771,10 @@ function drawArrow(
   selected = false,
   open = false,
   dimmed = false,
+  viewMode: 'construction' | 'blocks' | 'solveOrder' = 'construction',
+  stuck = false,
 ) {
-  const path = travelPath(arrow, layout, grid);
+  const path = travelPath(arrow, layout, level.grid);
   const cell = layout.cellSize;
   let start = 0;
   if (clock) {
@@ -500,7 +795,7 @@ function drawArrow(
       ? colors.arrowBlocked
       : clock?.kind === 'escape'
         ? colors.arrowEscaping
-        : paintColor(arrow);
+        : paintColor(arrow, level, viewMode);
   if (open) {
     const pulse = 0.4 + 0.35 * (0.5 + 0.5 * Math.sin(now / 160));
     ctx.strokeStyle = colors.arrowEscaping;
@@ -510,10 +805,19 @@ function drawArrow(
     ctx.lineJoin = 'round';
     strokeWindow(ctx, path, start, end - cell * HEAD_BACK);
     ctx.globalAlpha = dimmed ? 0.28 : 1;
+  } else if (stuck) {
+    const pulse = 0.45 + 0.4 * (0.5 + 0.5 * Math.sin(now / 140));
+    ctx.strokeStyle = colors.arrowBlocked;
+    ctx.globalAlpha = (dimmed ? 0.28 : 1) * pulse;
+    ctx.lineWidth = cell * 0.88;
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+    strokeWindow(ctx, path, start, end - cell * HEAD_BACK);
+    ctx.globalAlpha = dimmed ? 0.28 : 1;
   }
   ctx.strokeStyle = fill;
   ctx.fillStyle = fill;
-  ctx.lineWidth = cell * (selected || open ? 0.62 : 0.42);
+  ctx.lineWidth = cell * (selected || open || stuck ? 0.62 : 0.42);
   ctx.lineCap = 'round';
   ctx.lineJoin = 'round';
   strokeWindow(ctx, path, start, end - cell * HEAD_BACK);
@@ -530,9 +834,30 @@ function drawArrow(
   ctx.restore();
 }
 
-function paintColor(arrow: Level['arrows'][number]): string {
+const BLOCK_COLORS = ['#E4572E', '#F4C430', '#2FBF71', '#8B5CF6', '#0EA5E9', '#D946EF', '#22C55E'];
+
+function paintColor(
+  arrow: Level['arrows'][number],
+  level: Level,
+  viewMode: 'construction' | 'blocks' | 'solveOrder',
+): string {
+  if (viewMode === 'blocks') {
+    const block = arrow.blockId ?? 0;
+    return BLOCK_COLORS[Math.abs(block) % BLOCK_COLORS.length] ?? colors.arrow;
+  }
+  if (viewMode === 'solveOrder') {
+    const maxSolve = Math.max(
+      1,
+      ...level.arrows.map((a) => a.solveIndex ?? 0),
+    );
+    const index = arrow.solveIndex ?? 0;
+    const t = maxSolve <= 1 ? 0 : (index - 1) / (maxSolve - 1);
+    return `hsl(${210 - t * 160} 70% ${42 + t * 18}%)`;
+  }
   if (arrow.role === 'crumb' || arrow.id.startsWith('crumb-')) return colors.arrowCrumb;
-  if (arrow.role === 'filler' || arrow.id.startsWith('filler-')) return colors.arrowFiller;
+  if (arrow.role === 'filler' || arrow.id.startsWith('filler-') || arrow.id.startsWith('draw-')) {
+    return colors.arrowFiller;
+  }
   return colors.arrow;
 }
 
@@ -545,34 +870,26 @@ function strokeWindow(
   if (end <= start) return;
   ctx.beginPath();
   let started = false;
-  for (let i = 1; i < path.cumulative.length; i++) {
-    const a = path.cumulative[i - 1];
-    const b = path.cumulative[i];
-    if (b < start || a > end) continue;
-    const span = Math.max(0.0001, b - a);
-    const fromT = Math.max(0, (start - a) / span);
-    const toT = Math.min(1, (end - a) / span);
-    const x1 = path.xs[i - 1] + (path.xs[i] - path.xs[i - 1]) * fromT;
-    const y1 = path.ys[i - 1] + (path.ys[i] - path.ys[i - 1]) * fromT;
-    const x2 = path.xs[i - 1] + (path.xs[i] - path.xs[i - 1]) * toT;
-    const y2 = path.ys[i - 1] + (path.ys[i] - path.ys[i - 1]) * toT;
+  for (let d = start; d <= end; d += Math.max(1, (end - start) / 64)) {
+    const p = posTanAt(path.xs, path.ys, path.cumulative, d);
     if (!started) {
-      ctx.moveTo(x1, y1);
+      ctx.moveTo(p.x, p.y);
       started = true;
-    }
-    ctx.lineTo(x2, y2);
+    } else ctx.lineTo(p.x, p.y);
   }
+  const tip = posTanAt(path.xs, path.ys, path.cumulative, end);
+  ctx.lineTo(tip.x, tip.y);
   ctx.stroke();
 }
 
-function drawMarquee(ctx: CanvasRenderingContext2D, marquee: Marquee) {
-  const x = Math.min(marquee.x0, marquee.x1);
-  const y = Math.min(marquee.y0, marquee.y1);
-  const w = Math.abs(marquee.x1 - marquee.x0);
-  const h = Math.abs(marquee.y1 - marquee.y0);
+function drawMarquee(ctx: CanvasRenderingContext2D, box: Marquee) {
+  const x = Math.min(box.x0, box.x1);
+  const y = Math.min(box.y0, box.y1);
+  const w = Math.abs(box.x1 - box.x0);
+  const h = Math.abs(box.y1 - box.y0);
   ctx.save();
-  ctx.fillStyle = 'rgba(224, 32, 32, 0.12)';
-  ctx.strokeStyle = '#E02020';
+  ctx.strokeStyle = colors.arrowEscaping;
+  ctx.fillStyle = 'rgba(47, 191, 113, 0.12)';
   ctx.lineWidth = 1.5;
   ctx.setLineDash([6, 4]);
   ctx.fillRect(x, y, w, h);
@@ -585,38 +902,27 @@ function drawHud(
   width: number,
   height: number,
   lives: number,
-  status: 'playing' | 'won' | 'lost',
+  status: string,
   zoom: number,
-  editMode: boolean,
+  editing: boolean,
 ) {
-  ctx.font = '600 16px Segoe UI, sans-serif';
-  ctx.textAlign = 'left';
   ctx.fillStyle = colors.textPrimary;
-  if (editMode) {
-    ctx.fillText('Edit', 16, 28);
+  ctx.font = '600 13px Segoe UI, sans-serif';
+  ctx.textAlign = 'left';
+  if (editing) {
     ctx.fillStyle = colors.textSecondary;
-    ctx.fillText(
-      `${Math.round(zoom * 100)}%   click to select   drag to box-select   right-drag to pan`,
-      70,
-      28,
-    );
-    return;
+    ctx.fillText('Edit · scroll to zoom · Esc cancels a stroke', 14, 22);
+  } else {
+    ctx.fillText(`Lives ${lives}`, 14, 22);
+    ctx.fillStyle = colors.textSecondary;
+    ctx.fillText(`${Math.round(zoom * 100)}%`, 14, 40);
   }
-  ctx.fillText(
-    `${'♥'.repeat(Math.max(0, lives))}${'♡'.repeat(Math.max(0, MAX_LIVES - lives))}`,
-    16,
-    28,
-  );
-  ctx.fillStyle = colors.textSecondary;
-  ctx.fillText(`${Math.round(zoom * 100)}%   wheel or +/- to zoom   drag to pan   R restart`, 110, 28);
-
-  if (status === 'playing') return;
-  ctx.fillStyle = colors.overlay;
-  ctx.fillRect(0, 0, width, height);
-  ctx.fillStyle = '#ffffff';
-  ctx.font = '700 34px Segoe UI, sans-serif';
-  ctx.textAlign = 'center';
-  ctx.fillText(status === 'won' ? 'Cleared' : 'Out of hearts', width / 2, height / 2 - 8);
-  ctx.font = '500 18px Segoe UI, sans-serif';
-  ctx.fillText('Press R to try again', width / 2, height / 2 + 28);
+  if (status === 'won' || status === 'lost') {
+    ctx.fillStyle = colors.overlay;
+    ctx.fillRect(0, 0, width, height);
+    ctx.fillStyle = colors.textPrimary;
+    ctx.font = '700 28px Segoe UI, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText(status === 'won' ? 'Cleared' : 'Out of lives', width / 2, height / 2);
+  }
 }

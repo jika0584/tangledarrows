@@ -6,6 +6,7 @@ import type {
   GenerateRequest,
   GenerateShapedRequest,
   PxApi,
+  RefreshEndlessRequest,
   RegenerateRequest,
   StudioStatus,
 } from '../src/types';
@@ -33,9 +34,16 @@ const api: PxApi = {
       skipped: string[];
       cancelled?: 'now' | 'after';
     }>,
+  refreshEndless: (request: RefreshEndlessRequest) =>
+    ipcRenderer.invoke('px:refreshEndless', request) as Promise<{
+      generated: number[];
+      cancelled?: 'now' | 'after';
+    }>,
   cancelGenerate: (mode: 'now' | 'after') => ipcRenderer.invoke('px:cancelGenerate', mode) as Promise<void>,
   pickFolder: () =>
     ipcRenderer.invoke('px:pickFolder') as Promise<{ path: string; count: number } | null>,
+  listFolder: (path: string) =>
+    ipcRenderer.invoke('px:listFolder', path) as Promise<{ path: string; count: number }>,
   onProgress: (handler: (progress: GenerateProgress) => void) => {
     const listen = (_event: unknown, progress: GenerateProgress) => handler(progress);
     ipcRenderer.on('px:progress', listen);
@@ -45,6 +53,7 @@ const api: PxApi = {
   deleteCloud: (levelNumbers: number[]) => ipcRenderer.invoke('px:deleteCloud', levelNumbers),
   uploadSelected: (levelNumbers: number[]) => ipcRenderer.invoke('px:uploadSelected', levelNumbers),
   uploadPending: () => ipcRenderer.invoke('px:uploadPending'),
+  uploadEndlessPending: () => ipcRenderer.invoke('px:uploadEndlessPending'),
   pull: () => ipcRenderer.invoke('px:pull'),
   saveConfig: (config: CloudConfig) => ipcRenderer.invoke('px:saveConfig', config),
   setup: () => ipcRenderer.invoke('px:setup'),

@@ -26,6 +26,13 @@ async function getDb(): Promise<SQLite.SQLiteDatabase> {
   return dbPromise;
 }
 
+export interface BatchSaveResult {
+  /** Rows that were inserted or whose payload actually changed. */
+  changed: number;
+  /** Cleared boards whose payload was replaced (true regenerations only). */
+  regeneratedLevelNumbers: number[];
+}
+
 /**
  * On-device store for downloaded curated levels.
  * Only the active batch is retained — cleared batches are purged so the install
@@ -36,28 +43,33 @@ export const LocalCache = {
    * Writes a batch. Returns how many rows were new or actually different so
    * callers can stamp an update date only when content changed.
    */
-  async saveBatch(batchId: string, levels: Level[]): Promise<number> {
+  async saveBatch(batchId: string, levels: Level[]): Promise<BatchSaveResult> {
     const db = await getDb();
     let changed = 0;
+    const regeneratedLevelNumbers: number[] = [];
     await db.withTransactionAsync(async () => {
       for (const level of levels) {
         const payload = JSON.stringify(level);
+        const levelNumber = parseInt(level.id, 10);
         const existing = await db.getFirstAsync<{ payload: string }>(
           'SELECT payload FROM levels WHERE id = ? LIMIT 1',
           level.id,
         );
         if (existing?.payload === payload) continue;
+        if (existing && existing.payload !== payload && Number.isFinite(levelNumber)) {
+          regeneratedLevelNumbers.push(levelNumber);
+        }
         await db.runAsync(
           'INSERT OR REPLACE INTO levels (id, level_number, batch_id, payload) VALUES (?, ?, ?, ?)',
           level.id,
-          parseInt(level.id, 10),
+          levelNumber,
           batchId,
           payload,
         );
         changed++;
       }
     });
-    return changed;
+    return { changed, regeneratedLevelNumbers };
   },
 
   async getLevel(levelNumber: number): Promise<Level | null> {

@@ -11,9 +11,10 @@ import {
   profileForLevel,
   storedBoardSize,
 } from '../../src/procedural/CuratedGenerator';
-import { CELL_FLOOR, Level } from '../../src/levels/types';
+import { CELL_FLOOR, Level, formatSLevelId } from '../../src/levels/types';
 import { parseLevel } from '../../src/levels/parser';
 import { generateShapedLevel } from '../../src/procedural/ShapedLevelGenerator';
+import { SLevelGenerator } from '../../src/procedural/SLevelGenerator';
 import { matrixFromRaster, type Raster } from '../../src/procedural/shapeFromImage';
 import { listImageFiles, pickImageOrSquare } from './shapeFolder';
 import { parseLevelSpec } from './levelSpec';
@@ -36,6 +37,12 @@ import {
   supabaseUrl,
   upsertEnv,
 } from './env';
+import {
+  endlessCatalogKey,
+  isCampaignCatalogKey,
+  isEndlessCatalogKey,
+  sLevelIndexFromCatalogKey,
+} from './endlessIds';
 import { createClient } from '@supabase/supabase-js';
 import { readFileSync } from 'node:fs';
 import { basename, join } from 'node:path';
@@ -43,9 +50,13 @@ import { basename, join } from 'node:path';
 export interface StudioStatus {
   catalogPath: string;
   stored: number;
+  endlessStored: number;
   highest: number | null;
+  highestEndless: number | null;
   pending: number;
+  pendingEndless: number;
   nextLevel: number;
+  nextEndless: number;
   supabase: {
     configured: boolean;
     url: string;
@@ -69,9 +80,11 @@ export interface GenerateRequest {
   shapeFolder?: string;
   /** When a shape folder is set, also mix in plain square boards. */
   alsoUseSquares?: boolean;
+  /** Generate endless S-levels instead of campaign boards. */
+  endless?: boolean;
 }
 
-export type RasterFromPath = (filePath: string) => Raster;
+export type RasterFromPath = (filePath: string) => Raster | Promise<Raster>;
 
 export interface GenerateShapedRequest {
   levelNumber: number;
@@ -91,6 +104,16 @@ export interface RegenerateRequest {
   quality: 'fast' | 'normal' | 'quality';
 }
 
+export interface RefreshEndlessRequest {
+  quality: 'fast' | 'normal' | 'quality';
+  /** When no endless boards exist yet, create this many (default 25). */
+  starterCount?: number;
+  storedSize?: number;
+  storedSizes?: number[];
+  shapeFolder?: string;
+  alsoUseSquares?: boolean;
+}
+
 export interface GenerateProgress {
   current: number;
   total: number;
@@ -108,20 +131,26 @@ export interface CloudConfig {
 }
 
 const PULL_PAGE = 200;
+const DEFAULT_ENDLESS_STARTER = 25;
 
 export function studioStatus(): StudioStatus {
   loadEnv();
   const highest = Catalog.highest();
   const highestCampaign = Catalog.highestFrom(FIRST_CURATED_LEVEL);
+  const highestEndless = Catalog.highestEndlessIndex();
   return {
     catalogPath: catalogPath(),
     stored: Catalog.count(),
+    endlessStored: Catalog.endlessCount(),
     highest,
+    highestEndless,
     pending: Catalog.pendingUploadCount(),
+    pendingEndless: Catalog.pendingEndlessUploadCount(),
     nextLevel:
       highestCampaign === null
         ? FIRST_CURATED_LEVEL
         : Math.min(LAST_CURATED_LEVEL, highestCampaign + 1),
+    nextEndless: (highestEndless ?? 0) + 1,
     supabase: {
       configured: isUploadConfigured(),
       url: supabaseUrl(),
@@ -151,6 +180,14 @@ export function listCatalog(): CatalogRow[] {
   return Catalog.listAll();
 }
 
+export function listCampaignCatalog(): CatalogRow[] {
+  return Catalog.listCampaign();
+}
+
+export function listEndlessCatalog(): CatalogRow[] {
+  return Catalog.listEndless();
+}
+
 export function getCatalogLevel(levelNumber: number): Level | null {
   return Catalog.get(levelNumber);
 }
@@ -174,13 +211,17 @@ async function generateRangeWithHandle(
   rasterFromPath: RasterFromPath | undefined,
   handle: GenerationHandle,
 ): Promise<{ generated: number[]; skipped: number[]; cancelled?: 'now' | 'after' }> {
+  if (request.endless) {
+    return generateEndlessRangeWithHandle(request, onProgress, rasterFromPath, handle);
+  }
+
   const highestCampaign = Catalog.highestFrom(FIRST_CURATED_LEVEL);
   const from = request.from ?? (highestCampaign === null ? FIRST_CURATED_LEVEL : highestCampaign + 1);
   if (from < FIRST_CURATED_LEVEL || from > LAST_CURATED_LEVEL) {
     throw new Error(`Levels run ${FIRST_CURATED_LEVEL}–${LAST_CURATED_LEVEL}.`);
   }
   const to = Math.min(LAST_CURATED_LEVEL, from + Math.max(1, request.count) - 1);
-  const seedAttempts = request.quality === 'fast' ? 1 : request.quality === 'quality' ? 32 : 8;
+  const seedAttempts = request.quality === 'fast' ? 1 : request.quality === 'quality' ? 16 : 4;
   const generated: number[] = [];
   const skipped: number[] = [];
   const total = to - from + 1;
@@ -245,8 +286,9 @@ async function generateRangeWithHandle(
               alsoUseSquares,
               storedSize,
               handle,
+              request.quality,
             )
-          : generateCuratedLevel(n, { seedAttempts, storedSize });
+          : generateCuratedLevel(n, { seedAttempts, storedSize, quality: request.quality });
     } catch (error) {
       if (isGenerationCancelled(error)) {
         return { generated, skipped, cancelled: error.mode };
@@ -302,6 +344,7 @@ async function generateFromImage(
   alsoUseSquares: boolean,
   storedSize: number,
   handle?: GenerationHandle,
+  quality: GenerateRequest['quality'] = 'normal',
 ): Promise<Level> {
   const tried = new Set<string>();
   let next = imagePath;
@@ -311,7 +354,7 @@ async function generateFromImage(
     handle?.throwIfNow();
     tried.add(next);
     try {
-      const raster = rasterFromPath(next);
+      const raster = await rasterFromPath(next);
       const matrix = matrixFromRaster(raster, storedSize);
       const profile = profileForBoard(levelNumber, matrix.length);
       const floor = matrix.flat().filter((cell) => cell === CELL_FLOOR).length;
@@ -325,6 +368,7 @@ async function generateFromImage(
         difficulty: 'hard',
         matrix,
         seedAttempts,
+        quality,
         targetDensity: profile.targetDensity,
         maxArrowLength: profile.maxArrowLength,
         maxTailLength: profile.maxTailLength,
@@ -354,15 +398,15 @@ async function generateFromImage(
   }
 
   if (alsoUseSquares) {
-    return generateCuratedLevel(levelNumber, { seedAttempts, storedSize });
+    return generateCuratedLevel(levelNumber, { seedAttempts, storedSize, quality });
   }
   throw lastError instanceof Error ? lastError : new Error('Could not build a puzzle from that folder.');
 }
 
 function seedAttemptsFor(quality: GenerateRequest['quality']): number {
-  if (quality === 'fast') return 8;
-  if (quality === 'quality') return 48;
-  return 24;
+  if (quality === 'fast') return 1;
+  if (quality === 'quality') return 16;
+  return 4;
 }
 
 export async function generateShaped(
@@ -414,6 +458,7 @@ async function generateShapedWithHandle(
     difficulty,
     matrix: request.matrix,
     seedAttempts: attempts,
+    quality: request.quality,
     targetDensity: profile?.targetDensity,
     maxArrowLength: profile?.maxArrowLength,
     maxTailLength: profile?.maxTailLength,
@@ -514,7 +559,17 @@ async function regenerateRangeWithHandle(
     });
 
     const storedSize = existing.grid.rows;
-    const raster = rasterFromPath(imagePath);
+    let raster: Raster;
+    try {
+      raster = await rasterFromPath(imagePath);
+    } catch (error) {
+      if (isGenerationCancelled(error)) {
+        return { generated, skipped, cancelled: error.mode };
+      }
+      skipped.push(`${levelNumber} (could not read image)`);
+      continue;
+    }
+    const sidecarPath = findShapeImage(levelNumber, existing.metadata.shapeSource) ?? imagePath;
     const matrix = matrixFromRaster(raster, storedSize);
     const name = existing.metadata.name?.trim() || `Level ${levelNumber}`;
     let rebuilt: Level;
@@ -527,7 +582,7 @@ async function regenerateRangeWithHandle(
           quality: request.quality,
           replace: true,
           matrix,
-          shapeSource: existing.metadata.shapeSource || basename(imagePath),
+          shapeSource: existing.metadata.shapeSource || basename(sidecarPath),
         },
         (progress) => {
           onProgress?.({
@@ -548,7 +603,7 @@ async function regenerateRangeWithHandle(
       }
       throw error;
     }
-    saveShapeFromPath(levelNumber, imagePath);
+    saveShapeFromPath(levelNumber, sidecarPath);
     generated.push(levelNumber);
     onProgress?.({
       current: index + 1,
@@ -583,6 +638,7 @@ export function saveCatalogLevel(level: Level): Level {
 export async function uploadSelected(levelNumbers: number[]): Promise<{ uploaded: number; error?: string }> {
   if (levelNumbers.length === 0) return { uploaded: 0 };
   const rows = levelNumbers
+    .filter((n) => isCampaignCatalogKey(n) || isEndlessCatalogKey(n))
     .sort((a, b) => a - b)
     .map((n) => {
       const level = Catalog.get(n);
@@ -595,9 +651,437 @@ export async function uploadSelected(levelNumbers: number[]): Promise<{ uploaded
   return result;
 }
 
+/**
+ * Rebuild every stored endless board with a fresh seed. If none exist yet,
+ * creates a starter batch (default 25).
+ */
+export async function refreshEndless(
+  request: RefreshEndlessRequest,
+  onProgress?: (progress: GenerateProgress) => void,
+  rasterFromPath?: RasterFromPath,
+): Promise<{ generated: number[]; cancelled?: 'now' | 'after' }> {
+  const handle = beginGeneration();
+  try {
+    return await refreshEndlessWithHandle(request, onProgress, rasterFromPath, handle);
+  } finally {
+    endGeneration(handle);
+  }
+}
+
+async function refreshEndlessWithHandle(
+  request: RefreshEndlessRequest,
+  onProgress: ((progress: GenerateProgress) => void) | undefined,
+  rasterFromPath: RasterFromPath | undefined,
+  handle: GenerationHandle,
+): Promise<{ generated: number[]; cancelled?: 'now' | 'after' }> {
+  const existing = Catalog.listEndless();
+  const quality = request.quality;
+  const indices =
+    existing.length > 0
+      ? existing.map((row) => sLevelIndexFromCatalogKey(row.levelNumber)).sort((a, b) => a - b)
+      : Array.from(
+          { length: Math.max(1, request.starterCount ?? DEFAULT_ENDLESS_STARTER) },
+          (_, i) => i + 1,
+        );
+
+  const images = request.shapeFolder ? listImageFiles(request.shapeFolder) : [];
+  const alsoUseSquares = Boolean(request.alsoUseSquares);
+  if (request.shapeFolder) {
+    if (!rasterFromPath) {
+      throw new Error('Reading a shape folder needs the PX window.');
+    }
+    if (images.length === 0 && !alsoUseSquares) {
+      throw new Error('That folder has no images. Add PNG/JPG files, or tick “also use squares”.');
+    }
+  }
+
+  const generated: number[] = [];
+  const total = indices.length;
+  const genRequest: GenerateRequest = {
+    count: 1,
+    quality,
+    replace: true,
+    storedSize: request.storedSize,
+    storedSizes: request.storedSizes,
+    shapeFolder: request.shapeFolder,
+    alsoUseSquares: request.alsoUseSquares,
+    endless: true,
+  };
+
+  for (let i = 0; i < indices.length; i++) {
+    try {
+      handle.throwIfNow();
+    } catch (error) {
+      if (isGenerationCancelled(error)) {
+        return { generated, cancelled: error.mode };
+      }
+      throw error;
+    }
+
+    const sIndex = indices[i];
+    const catalogKey = endlessCatalogKey(sIndex);
+    onProgress?.({
+      current: i,
+      total,
+      levelNumber: catalogKey,
+      arrows: 0,
+      fill: 0,
+      openings: 0,
+      difficulty: 'hard',
+    });
+
+    let level: Level;
+    try {
+      level = await generateOneEndlessBoard(
+        sIndex,
+        genRequest,
+        images,
+        alsoUseSquares,
+        true,
+        rasterFromPath,
+        handle,
+      );
+    } catch (error) {
+      if (isGenerationCancelled(error)) {
+        return { generated, cancelled: error.mode };
+      }
+      throw error;
+    }
+    Catalog.save(level);
+    generated.push(catalogKey);
+
+    onProgress?.({
+      current: i + 1,
+      total,
+      levelNumber: catalogKey,
+      arrows: level.arrows.length,
+      fill: fillRatio(level),
+      openings: openingCount(level),
+      difficulty: level.metadata.difficulty ?? 'hard',
+    });
+    await yieldEventLoop();
+    if (handle.stopAfterCurrent()) {
+      return { generated, cancelled: handle.mode === 'now' ? 'now' : 'after' };
+    }
+  }
+
+  return { generated };
+}
+
+async function generateEndlessRangeWithHandle(
+  request: GenerateRequest,
+  onProgress: ((progress: GenerateProgress) => void) | undefined,
+  rasterFromPath: RasterFromPath | undefined,
+  handle: GenerationHandle,
+): Promise<{ generated: number[]; skipped: number[]; cancelled?: 'now' | 'after' }> {
+  const highestEndless = Catalog.highestEndlessIndex();
+  const from = request.from ?? (highestEndless === null ? 1 : highestEndless + 1);
+  if (from < 1) throw new Error('Endless boards start at S1.');
+  const to = from + Math.max(1, request.count) - 1;
+  const generated: number[] = [];
+  const skipped: number[] = [];
+  const total = to - from + 1;
+  const images = request.shapeFolder ? listImageFiles(request.shapeFolder) : [];
+  const alsoUseSquares = Boolean(request.alsoUseSquares);
+
+  if (request.shapeFolder) {
+    if (!rasterFromPath) {
+      throw new Error('Reading a shape folder needs the PX window.');
+    }
+    if (images.length === 0 && !alsoUseSquares) {
+      throw new Error('That folder has no images. Add PNG/JPG files, or tick “also use squares”.');
+    }
+  }
+
+  onProgress?.({
+    current: 0,
+    total,
+    levelNumber: endlessCatalogKey(from),
+    arrows: 0,
+    fill: 0,
+    openings: 0,
+    difficulty: 'hard',
+  });
+
+  for (let sIndex = from; sIndex <= to; sIndex++) {
+    try {
+      handle.throwIfNow();
+    } catch (error) {
+      if (isGenerationCancelled(error)) {
+        return { generated, skipped, cancelled: error.mode };
+      }
+      throw error;
+    }
+
+    const catalogKey = endlessCatalogKey(sIndex);
+    if (!request.replace && Catalog.has(catalogKey)) {
+      skipped.push(catalogKey);
+      onProgress?.({
+        current: generated.length + skipped.length,
+        total,
+        levelNumber: catalogKey,
+        arrows: 0,
+        fill: 0,
+        openings: 0,
+        difficulty: 'hard',
+      });
+      continue;
+    }
+
+    let level: Level;
+    try {
+      level = await generateOneEndlessBoard(
+        sIndex,
+        request,
+        images,
+        alsoUseSquares,
+        Boolean(request.replace),
+        rasterFromPath,
+        handle,
+      );
+    } catch (error) {
+      if (isGenerationCancelled(error)) {
+        return { generated, skipped, cancelled: error.mode };
+      }
+      throw error;
+    }
+    Catalog.save(level);
+    generated.push(catalogKey);
+
+    onProgress?.({
+      current: generated.length + skipped.length,
+      total,
+      levelNumber: catalogKey,
+      arrows: level.arrows.length,
+      fill: fillRatio(level),
+      openings: openingCount(level),
+      difficulty: level.metadata.difficulty ?? 'hard',
+    });
+    await yieldEventLoop();
+    if (handle.stopAfterCurrent()) {
+      return { generated, skipped, cancelled: handle.mode === 'now' ? 'now' : 'after' };
+    }
+  }
+
+  return { generated, skipped };
+}
+
+/**
+ * One endless board: same size / silhouette options as campaign multi-generate.
+ * Squares use an interior sized from the picked stored size; images use the
+ * raster silhouette at that size.
+ */
+async function generateOneEndlessBoard(
+  sIndex: number,
+  request: GenerateRequest,
+  images: string[],
+  alsoUseSquares: boolean,
+  forceRandomize: boolean,
+  rasterFromPath: RasterFromPath | undefined,
+  handle: GenerationHandle,
+): Promise<Level> {
+  const storedSize = pickEndlessStoredSize(sIndex, request);
+
+  if (request.shapeFolder) {
+    if (!rasterFromPath) {
+      throw new Error('Reading a shape folder needs the PX window.');
+    }
+    const imagePath = pickImageOrSquare(images, alsoUseSquares);
+    if (imagePath) {
+      const level = await generateEndlessFromImage(
+        sIndex,
+        imagePath,
+        seedAttemptsFor(request.quality),
+        rasterFromPath,
+        images,
+        alsoUseSquares,
+        storedSize,
+        handle,
+        request.quality,
+      );
+      return stampEndless(level, sIndex);
+    }
+    // null only when “also use squares” intentionally rolled a square slot
+    if (!alsoUseSquares) {
+      throw new Error('Shape folder is set but no images were available.');
+    }
+  }
+
+  const interior = Math.max(MIN_STORED_BOARD_SIZE - 2, storedSize - 2);
+  return stampEndless(
+    new SLevelGenerator().generate({
+      sLevelIndex: sIndex,
+      quality: request.quality,
+      forceRandomize,
+      gridSize: interior,
+    }),
+    sIndex,
+  );
+}
+
+function pickEndlessStoredSize(sIndex: number, request: GenerateRequest): number {
+  const sizes = allowedStoredSizes(request);
+  if (sizes.length > 0) {
+    return sizes[Math.floor(Math.random() * sizes.length)]!;
+  }
+  try {
+    return storedBoardSize(sIndex);
+  } catch {
+    return MIN_STORED_BOARD_SIZE;
+  }
+}
+
+async function generateEndlessFromImage(
+  sIndex: number,
+  imagePath: string,
+  seedAttempts: number,
+  rasterFromPath: RasterFromPath,
+  images: string[],
+  alsoUseSquares: boolean,
+  storedSize: number,
+  handle: GenerationHandle,
+  quality: GenerateRequest['quality'],
+): Promise<Level> {
+  const tried = new Set<string>();
+  let next = imagePath;
+  let lastError: unknown;
+  const catalogKey = endlessCatalogKey(sIndex);
+
+  for (let attempt = 0; attempt < Math.max(1, Math.min(4, Math.max(1, images.length))); attempt++) {
+    handle.throwIfNow();
+    tried.add(next);
+    try {
+      const raster = await rasterFromPath(next);
+      const matrix = matrixFromRaster(raster, storedSize);
+      const profile = profileForBoard(sIndex, matrix.length);
+      const floor = matrix.flat().filter((cell) => cell === CELL_FLOOR).length;
+      const interior = Math.max(1, (matrix.length - 2) * (matrix.length - 2));
+      const rectangular = floor >= interior * 0.95;
+      const shapeSource = basename(next);
+
+      const level = await generateShapedEndless({
+        sIndex,
+        matrix,
+        seedAttempts,
+        quality,
+        targetDensity: profile.targetDensity,
+        maxArrowLength: profile.maxArrowLength,
+        maxTailLength: profile.maxTailLength,
+        minArrows: rectangular ? profile.minArrows : undefined,
+        checkCancel: () => handle.throwIfNow(),
+        onAttempt: async () => {
+          await yieldEventLoop();
+          handle.throwIfNow();
+        },
+      });
+
+      saveShapeFromPath(catalogKey, next);
+      return {
+        ...level,
+        metadata: {
+          ...level.metadata,
+          shapeSource,
+        },
+      };
+    } catch (caught) {
+      if (isGenerationCancelled(caught)) throw caught;
+      lastError = caught;
+      const remaining = images.filter((file) => !tried.has(file));
+      if (remaining.length === 0) break;
+      next = remaining[Math.floor(Math.random() * remaining.length)];
+    }
+  }
+
+  if (alsoUseSquares) {
+    const interior = Math.max(MIN_STORED_BOARD_SIZE - 2, storedSize - 2);
+    return new SLevelGenerator().generate({
+      sLevelIndex: sIndex,
+      quality,
+      forceRandomize: true,
+      gridSize: interior,
+    });
+  }
+  throw lastError instanceof Error
+    ? lastError
+    : new Error(`Could not build S${sIndex} from that silhouette.`);
+}
+
+async function generateShapedEndless(options: {
+  sIndex: number;
+  matrix: import('../../src/levels/types').CellValue[][];
+  seedAttempts: number;
+  quality: GenerateRequest['quality'];
+  targetDensity: number;
+  maxArrowLength: number;
+  maxTailLength: number;
+  minArrows?: number;
+  checkCancel?: () => void;
+  onAttempt?: () => void | Promise<void>;
+}): Promise<Level> {
+  const attempts = Math.max(1, options.seedAttempts);
+  const candidates: Level[] = [];
+  let best: Level | null = null;
+  const generator = new SLevelGenerator();
+
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    options.checkCancel?.();
+    const level = generator.generate({
+      sLevelIndex: options.sIndex,
+      seed: attempt + 1,
+      shapeMatrix: options.matrix,
+      targetDensity: options.targetDensity,
+      maxArrowLength: options.maxArrowLength,
+      maxTailLength: options.maxTailLength,
+      minArrows: options.minArrows,
+      quality: options.quality,
+    });
+    if (level.arrows.length > 0) {
+      candidates.push(level);
+      if (
+        best === null ||
+        fillRatio(level) > fillRatio(best) ||
+        (fillRatio(level) === fillRatio(best) && openingCount(level) < openingCount(best))
+      ) {
+        best = level;
+      }
+    }
+    await options.onAttempt?.();
+    options.checkCancel?.();
+  }
+
+  if (!best || candidates.length === 0) {
+    throw new Error(
+      `No solvable S${options.sIndex} board from ${attempts} seed(s). Try a chunkier silhouette or higher quality.`,
+    );
+  }
+  return best;
+}
+
+function stampEndless(level: Level, sIndex: number): Level {
+  return {
+    ...level,
+    id: formatSLevelId(sIndex),
+    source: 'procedural',
+    metadata: {
+      ...level.metadata,
+      authoredAt: new Date().toISOString(),
+      name: formatSLevelId(sIndex),
+      arrowCount: level.arrows.length,
+    },
+  };
+}
+
 export async function uploadPending(): Promise<{ uploaded: number; error?: string }> {
   const pending = Catalog.listAll()
-    .filter((row) => row.uploadedAt === null && row.levelNumber >= FIRST_CURATED_LEVEL)
+    .filter((row) => row.uploadedAt === null && isCampaignCatalogKey(row.levelNumber))
+    .map((row) => row.levelNumber);
+  return uploadSelected(pending);
+}
+
+/** Upload every endless board that has not been pushed to Supabase yet. */
+export async function uploadEndlessPending(): Promise<{ uploaded: number; error?: string }> {
+  const pending = Catalog.listEndless()
+    .filter((row) => row.uploadedAt === null)
     .map((row) => row.levelNumber);
   return uploadSelected(pending);
 }

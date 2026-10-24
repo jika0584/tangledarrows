@@ -1,5 +1,5 @@
 {
-  "name": "amaze-escape",
+  "name": "tangled-arrows",
   "version": "1.0.0",
   "main": "expo-router/entry",
   "dependencies": {
@@ -53,7 +53,7 @@
     "update:preview": "eas update --channel preview --platform android --environment preview",
     "update:prod": "eas update --channel production --platform android --environment production",
     "typecheck": "tsc --noEmit",
-    "test:levels": "tsx src/procedural/__tests__/SLevelGenerator.test.ts && tsx src/procedural/__tests__/CuratedGenerator.test.ts && tsx src/procedural/__tests__/shapeFromImage.test.ts && tsx src/procedural/__tests__/editArrows.test.ts && tsx src/store/__tests__/campaignCatchUp.test.ts && tsx src/game/engine/__tests__/Solution.test.ts",
+    "test:levels": "tsx src/procedural/__tests__/SLevelGenerator.test.ts && tsx src/procedural/__tests__/CuratedGenerator.test.ts && tsx src/procedural/__tests__/shapeFromImage.test.ts && tsx src/procedural/__tests__/editArrows.test.ts && tsx src/store/__tests__/campaignCatchUp.test.ts && tsx src/game/engine/__tests__/Solution.test.ts && tsx src/game/engine/__tests__/HitTest.test.ts",
     "gen:levels": "tsx scripts/generateShapedLevels.ts",
     "px": "tsx tools/px/cli.ts",
     "px:ui": "vite --config tools/px-ui/vite.config.ts",

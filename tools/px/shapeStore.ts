@@ -1,5 +1,5 @@
 import { copyFileSync, existsSync, mkdirSync, readdirSync, unlinkSync, writeFileSync } from 'node:fs';
-import { basename, extname, join } from 'node:path';
+import { basename, dirname, extname, join, resolve } from 'node:path';
 import { projectRoot } from './env';
 import { defaultShapeFolder, listImageFiles } from './shapeFolder';
 
@@ -22,7 +22,11 @@ function destPath(levelNumber: number, fileName: string): string {
 }
 
 export function saveShapeFromPath(levelNumber: number, imagePath: string): string {
+  if (!existsSync(imagePath)) {
+    throw new Error(`Shape image missing: ${imagePath}`);
+  }
   const dest = destPath(levelNumber, imagePath);
+  if (resolve(imagePath).toLowerCase() === resolve(dest).toLowerCase()) return dest;
   copyFileSync(imagePath, dest);
   return dest;
 }
@@ -48,4 +52,8 @@ export function findShapeImage(levelNumber: number, shapeSource?: string): strin
   if (existsSync(direct)) return direct;
   const base = basename(shapeSource);
   return listImageFiles(backgrounds).find((file) => basename(file) === base) ?? null;
+}
+
+export function isShapeSidecar(file: string): boolean {
+  return resolve(dirname(file)).toLowerCase() === resolve(shapesDir()).toLowerCase();
 }

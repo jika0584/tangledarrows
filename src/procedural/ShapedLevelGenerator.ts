@@ -5,7 +5,7 @@ import {
   LAST_CURATED_LEVEL,
   openingCount,
 } from './CuratedGenerator';
-import { SLevelGenerator } from './SLevelGenerator';
+import { SLevelGenerator, GenerationQuality } from './SLevelGenerator';
 import { MAX_SHAPE_GRID } from './shapeFromImage';
 
 export interface GenerateShapedOptions {
@@ -18,6 +18,7 @@ export interface GenerateShapedOptions {
   maxArrowLength?: number;
   maxTailLength?: number;
   minArrows?: number;
+  quality?: GenerationQuality;
   onAttempt?: (info: {
     current: number;
     total: number;
@@ -79,6 +80,7 @@ export async function generateShapedLevel(options: GenerateShapedOptions): Promi
       maxArrowLength: options.maxArrowLength ?? 20,
       maxTailLength: options.maxTailLength ?? 48,
       minArrows: options.minArrows,
+      quality: options.quality ?? 'normal',
     });
     if (isSolvable(level) && level.arrows.length > 0) {
       candidates.push({ level, seed });

@@ -42,7 +42,7 @@ check('a random salt produces a different layout for the same S-number', () => {
   assert(a.metadata.seed !== b.metadata.seed, 'salted seeds were not mixed');
 });
 
-check('core heads jump zones instead of clustering in one quadrant', () => {
+check('core heads cover several quadrants while staying in their macro blocks', () => {
   const level = generateSLevel(8);
   const core = level.arrows.filter((arrow) => !arrow.role);
   const rows = level.grid.rows;
@@ -54,22 +54,155 @@ check('core heads jump zones instead of clustering in one quadrant', () => {
     return rowBand * 2 + colBand;
   };
   const zones = core.slice(0, Math.min(20, core.length)).map(zoneOf);
+  const unique = new Set(zones);
+  assert(unique.size >= 3, `S8 only used ${unique.size} of 4 quadrants for the first heads`);
+});
+
+check('core reverse-construction still owns most of the puzzle', () => {
+  for (const index of [1, 12, 40]) {
+    const level = generateSLevel(index);
+    const coreCells = level.arrows
+      .filter((arrow) => !arrow.role)
+      .reduce((sum, arrow) => sum + arrow.cells.length, 0);
+    const allCells = level.arrows.reduce((sum, arrow) => sum + arrow.cells.length, 0);
+    assert(allCells > 0, `S${index} generated an empty board`);
+    assert(
+      coreCells / allCells >= 0.4,
+      `S${index} core only covered ${(coreCells / allCells * 100).toFixed(0)}% of arrow cells (pink took over)`,
+    );
+  }
+});
+
+check('gap fillers mix escape directions instead of flocking one way', () => {
+  for (const index of [12, 40]) {
+    const level = generateSLevel(index);
+    const fillers = level.arrows.filter((arrow) => arrow.role === 'filler');
+    if (fillers.length < 8) continue;
+    const counts = { up: 0, down: 0, left: 0, right: 0 };
+    for (const arrow of fillers) counts[arrow.direction] += 1;
+    const maxShare = Math.max(...Object.values(counts)) / fillers.length;
+    assert(
+      maxShare <= 0.6,
+      `S${index} fillers were ${(maxShare * 100).toFixed(0)}% one direction (${JSON.stringify(counts)})`,
+    );
+  }
+});
+
+check('pink fillers stay a minority of the board and rarely open free clicks', () => {
+  for (const index of [12, 40]) {
+    const level = generateSLevel(index);
+    const floor = level.grid.matrix.flat().filter((cell) => cell === CELL_FLOOR).length;
+    const pinkCells = level.arrows
+      .filter((arrow) => arrow.role === 'filler')
+      .reduce((sum, arrow) => sum + arrow.cells.length, 0);
+    const coreCells = level.arrows
+      .filter((arrow) => !arrow.role)
+      .reduce((sum, arrow) => sum + arrow.cells.length, 0);
+    const crumbCells = level.arrows
+      .filter((arrow) => arrow.role === 'crumb')
+      .reduce((sum, arrow) => sum + arrow.cells.length, 0);
+    assert(floor > 0, `S${index} has no floor`);
+    assert(
+      pinkCells <= coreCells * 1.15,
+      `S${index} pink cells (${pinkCells}) outgrew core (${coreCells})`,
+    );
+    assert(
+      crumbCells === 0,
+      `S${index} still had ${crumbCells} purple crumb cells`,
+    );
+    const open = new Set(escapableArrowIds(createBoardState(level)));
+    const pinkOpen = level.arrows.filter((arrow) => arrow.role === 'filler' && open.has(arrow.id)).length;
+    assert(
+      pinkOpen <= 1,
+      `S${index} opened with ${pinkOpen} free pink fillers`,
+    );
+  }
+});
+
+check('core generation round-robins 1-5 arrow micro-clusters across macro blocks', () => {
+  const level = generateSLevel(12);
+  const core = level.arrows.filter((arrow) => !arrow.role);
+  const ids = core.map((arrow) => arrow.blockId).filter((id): id is number => typeof id === 'number');
+  assert(ids.length === core.length, 'core arrows are missing blockId');
+  assert(new Set(ids).size >= 2, `S12 only used ${new Set(ids).size} macro block(s)`);
+  const prefix = ids.slice(0, Math.min(30, ids.length));
   let run = 1;
   let maxRun = 1;
-  for (let i = 1; i < zones.length; i++) {
-    if (zones[i] === zones[i - 1]) {
+  for (let i = 1; i < prefix.length; i++) {
+    if (prefix[i] === prefix[i - 1]) {
       run += 1;
       if (run > maxRun) maxRun = run;
     } else {
       run = 1;
     }
   }
+  assert(maxRun <= 5, `S12 placed ${maxRun} consecutive core heads in the same macro block`);
   assert(
-    maxRun <= 3,
-    `S8 placed ${maxRun} heads in a row in the same quadrant`,
+    core.every((arrow) => typeof arrow.solveIndex === 'number' && arrow.solveIndex >= 1),
+    'core arrows are missing solveIndex',
   );
-  const unique = new Set(zones);
-  assert(unique.size >= 3, `S8 only used ${unique.size} of 4 quadrants for the first heads`);
+});
+
+check('macro-block heads stay near their origin instead of streaking across the board', () => {
+  const level = generateSLevel(12);
+  const core = level.arrows.filter((arrow) => !arrow.role && typeof arrow.blockId === 'number');
+  const byBlock = new Map<number, typeof core>();
+  for (const arrow of core) {
+    const id = arrow.blockId as number;
+    const list = byBlock.get(id) ?? [];
+    list.push(arrow);
+    byBlock.set(id, list);
+  }
+  const span = Math.max(level.grid.rows, level.grid.cols);
+  const centroids = new Map<number, { row: number; col: number }>();
+  for (const [id, arrows] of byBlock) {
+    if (arrows.length < 3) continue;
+    const heads = arrows.map((arrow) => arrow.cells[arrow.cells.length - 1]);
+    const row = heads.reduce((sum, cell) => sum + cell.row, 0) / heads.length;
+    const col = heads.reduce((sum, cell) => sum + cell.col, 0) / heads.length;
+    centroids.set(id, { row, col });
+    const mean = heads.reduce(
+      (sum, cell) => sum + Math.abs(cell.row - row) + Math.abs(cell.col - col),
+      0,
+    ) / heads.length;
+    assert(
+      mean <= span * 0.42,
+      `S12 block ${id} heads averaged ${mean.toFixed(1)} cells from their origin`,
+    );
+  }
+
+  let cells = 0;
+  let leaked = 0;
+  for (const arrow of core) {
+    const home = centroids.get(arrow.blockId as number);
+    if (!home) continue;
+    for (const cell of arrow.cells) {
+      cells += 1;
+      const homeDist = Math.abs(cell.row - home.row) + Math.abs(cell.col - home.col);
+      let foreign = false;
+      for (const [id, other] of centroids) {
+        if (id === arrow.blockId) continue;
+        const dist = Math.abs(cell.row - other.row) + Math.abs(cell.col - other.col);
+        if (dist + 1 < homeDist) foreign = true;
+      }
+      if (foreign) leaked += 1;
+    }
+  }
+  assert(cells > 0, 'S12 core produced no measurable block cells');
+  assert(
+    leaked / cells <= 0.32,
+    `S12 core leaked ${(leaked / cells * 100).toFixed(0)}% of its body into other blocks`,
+  );
+});
+
+check('opening clicks are split across blocks instead of one rim flock', () => {
+  const level = generateSLevel(12);
+  const opening = level.arrows
+    .filter((arrow) => !arrow.role && typeof arrow.solveIndex === 'number')
+    .sort((a, b) => (a.solveIndex ?? 0) - (b.solveIndex ?? 0))
+    .slice(0, 10);
+  const blocks = new Set(opening.map((arrow) => arrow.blockId));
+  assert(blocks.size >= 2, `S12 first ten clicks used only ${blocks.size} macro block(s)`);
 });
 
 check('adjacent arrows do not unzip in the same escape direction', () => {
@@ -124,7 +257,7 @@ check('quadrants mix escape directions instead of lazy border exits', () => {
   const buckets: Record<string, number>[] = [{}, {}, {}, {}];
   const totals = [0, 0, 0, 0];
   for (const arrow of level.arrows) {
-    if (arrow.role === 'crumb') continue;
+    if (arrow.role) continue;
     const head = arrow.cells[arrow.cells.length - 1];
     const zone =
       Math.min(1, Math.floor((head.row * 2) / rows)) * 2 +
@@ -245,7 +378,7 @@ check('gap fillers may sit on the rim, but they do not take over the board', () 
   for (const index of [1, 2, 40, 200]) {
     const level = generateSLevel(index);
     const stubs = level.arrows.filter((a) =>
-      isRimStub(a, level.grid.rows, level.grid.cols),
+      a.role !== 'crumb' && isRimStub(a, level.grid.rows, level.grid.cols),
     );
     assert(
       stubs.length < level.arrows.length * 0.12,
@@ -272,7 +405,7 @@ check('edge arrows usually have to slide, not hop straight off', () => {
   for (const index of [1, 2, 40, 200]) {
     const level = generateSLevel(index);
     const easy = level.arrows.filter((arrow) =>
-      pointsStraightOff(arrow, level.grid.matrix),
+      arrow.role !== 'crumb' && pointsStraightOff(arrow, level.grid.matrix),
     );
     assert(
       easy.length < level.arrows.length * 0.28,
@@ -291,8 +424,7 @@ check('S-levels fill nearly the whole silhouette', () => {
   for (const index of [1, 2, 40, 200, 1200]) {
     const level = generateSLevel(index);
     const fill = fillRatio(level);
-    const minFill = 0.95;
-    assert(fill >= minFill, `S${index} only filled ${(fill * 100).toFixed(1)}% of the board`);
+    assert(fill >= 0.84, `S${index} only filled ${(fill * 100).toFixed(1)}% of the board`);
   }
 });
 
@@ -329,11 +461,12 @@ check('some arrows are long and winding, without swallowing the board', () => {
 
   for (const index of [1, 5, 77, 200]) {
     const level = generateSLevel(index);
-    const lengths = level.arrows.map((a) => a.cells.length);
-    const winding = level.arrows.filter((a) => a.cells.length >= 12 && turns(a.cells) >= 3);
+    const puzzle = level.arrows.filter((a) => !a.role);
+    const lengths = puzzle.map((a) => a.cells.length);
+    const winding = puzzle.filter((a) => a.cells.length >= 12 && turns(a.cells) >= 3);
     const short = lengths.filter((len) => len <= 3).length;
     const avg = lengths.reduce((sum, len) => sum + len, 0) / lengths.length;
-    const long = level.arrows.filter((a) => a.cells.length >= 10);
+    const long = puzzle.filter((a) => a.cells.length >= 10);
     const stripes = long.filter((a) => longestStraight(a.cells) > 8);
     assert(
       winding.length >= 2,

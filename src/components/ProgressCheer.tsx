@@ -1,13 +1,13 @@
-import React, { useEffect, useRef, useState } from 'react';
-import { StyleSheet, Text } from 'react-native';
-import Animated, { FadeInDown, FadeOutUp } from 'react-native-reanimated';
-import { spacing, typography, useColors } from '../theme/theme';
+import React, { useEffect, useRef, useState } from "react";
+import { StyleSheet, Text } from "react-native";
+import Animated, { FadeInDown, FadeOutUp } from "react-native-reanimated";
+import { spacing, typography, useColors } from "../theme/theme";
 
 const THRESHOLDS = [
-  { ratio: 0.75, message: 'Nice start!' },
-  { ratio: 0.5, message: 'Halfway there!' },
+  { ratio: 0.75, message: "Nice start!" },
+  { ratio: 0.5, message: "Halfway there!" },
   { ratio: 0.2, message: "You've got this!" },
-  { ratio: 0.1, message: 'So close!' },
+  { ratio: 0.1, message: "So close!" },
 ] as const;
 
 interface ProgressCheerProps {
@@ -16,24 +16,39 @@ interface ProgressCheerProps {
   playing: boolean;
 }
 
-export function ProgressCheer({ arrowsLeft, arrowTotal, playing }: ProgressCheerProps) {
+export function ProgressCheer({
+  arrowsLeft,
+  arrowTotal,
+  playing,
+}: ProgressCheerProps) {
   const colors = useColors();
   const [message, setMessage] = useState<string | null>(null);
   const shown = useRef(new Set<number>());
   const previous = useRef(arrowTotal);
+  const hideTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
     shown.current.clear();
     previous.current = arrowTotal;
+    if (hideTimer.current) clearTimeout(hideTimer.current);
+    hideTimer.current = null;
     setMessage(null);
   }, [arrowTotal]);
 
   useEffect(() => {
-    if (!playing || arrowTotal <= 0) return;
+    if (!playing) {
+      if (hideTimer.current) clearTimeout(hideTimer.current);
+      hideTimer.current = null;
+      setMessage(null);
+      return;
+    }
+    if (arrowTotal <= 0) return;
 
     if (arrowsLeft >= arrowTotal) {
       shown.current.clear();
       previous.current = arrowsLeft;
+      if (hideTimer.current) clearTimeout(hideTimer.current);
+      hideTimer.current = null;
       setMessage(null);
       return;
     }
@@ -54,14 +69,30 @@ export function ProgressCheer({ arrowsLeft, arrowTotal, playing }: ProgressCheer
     if (!latest) return;
 
     setMessage(latest.message);
-    const hide = setTimeout(() => setMessage(null), 1700);
-    return () => clearTimeout(hide);
+    if (hideTimer.current) clearTimeout(hideTimer.current);
+    hideTimer.current = setTimeout(() => {
+      setMessage(null);
+      hideTimer.current = null;
+    }, 1700);
   }, [arrowsLeft, arrowTotal, playing]);
+
+  useEffect(
+    () => () => {
+      if (hideTimer.current) clearTimeout(hideTimer.current);
+    },
+    [],
+  );
 
   if (!message || !playing) return null;
 
   return (
-    <Animated.View pointerEvents="none" entering={FadeInDown.duration(220)} exiting={FadeOutUp.duration(220)} style={styles.wrap}>
+    <Animated.View
+      key={message}
+      pointerEvents="none"
+      entering={FadeInDown.duration(220)}
+      exiting={FadeOutUp.duration(220)}
+      style={styles.wrap}
+    >
       <Text
         style={[
           styles.label,
@@ -80,19 +111,15 @@ export function ProgressCheer({ arrowsLeft, arrowTotal, playing }: ProgressCheer
 
 const styles = StyleSheet.create({
   wrap: {
-    position: 'absolute',
-    top: 12,
-    left: 24,
-    right: 24,
-    alignItems: 'center',
+    alignSelf: "flex-start",
   },
   label: {
-    ...typography.heading,
-    overflow: 'hidden',
-    paddingHorizontal: spacing.lg,
-    paddingVertical: spacing.sm,
+    ...typography.label,
+    overflow: "hidden",
+    paddingHorizontal: spacing.md,
+    paddingVertical: 4,
     borderRadius: 999,
-    textAlign: 'center',
+    textAlign: "center",
     elevation: 4,
     shadowOpacity: 0.12,
     shadowRadius: 12,

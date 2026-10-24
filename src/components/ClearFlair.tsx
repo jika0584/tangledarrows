@@ -30,7 +30,7 @@ export function ClearFlair({ perfect, firstTry }: ClearFlairProps) {
     stampScale.value = 0.35;
     stampRotate.value = -18;
     stampScale.value = withSequence(
-      withTiming(1.18, { duration: 420, easing: Easing.out(Easing.back) }),
+      withTiming(1.18, { duration: 420, easing: Easing.out(Easing.cubic) }),
       withTiming(1, { duration: 180, easing: Easing.out(Easing.quad) }),
     );
     stampRotate.value = withTiming(0, { duration: 480, easing: Easing.out(Easing.cubic) });

@@ -1,6 +1,7 @@
 import { Level, LevelBatchManifest } from '../levels/types';
 import { parseLevel } from '../levels/parser';
 import { useCatalogStamp } from '../store/catalogStamp';
+import { useProgressStore } from '../store/progressStore';
 import { getSupabase } from './supabaseClient';
 import { LocalCache } from './LocalCache';
 
@@ -73,13 +74,16 @@ export const BatchDownloader = {
     const endLevel = numbers[numbers.length - 1] ?? startLevel + BATCH_SIZE - 1;
     const batchId = `batch-${startLevel}-${endLevel}`;
     const changed = await LocalCache.saveBatch(batchId, levels);
-    if (changed > 0) {
+    if (changed.changed > 0) {
       await useCatalogStamp.getState().recordUpdate();
+    }
+    if (changed.regeneratedLevelNumbers.length > 0) {
+      await useProgressStore.getState().markLevelsRegenerated(changed.regeneratedLevelNumbers);
     }
 
     return {
       status: 'downloaded',
-      levelsAdded: changed,
+      levelsAdded: changed.changed,
       manifest: {
         batchId,
         startLevel,
